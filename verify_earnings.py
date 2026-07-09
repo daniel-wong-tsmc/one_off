@@ -753,6 +753,112 @@ class EdinetSource(Source):
                 out[cal_key_from_date(pe.isoformat())] = disc
         return out
 
+    # ---- segment / geographic (dimensional XBRL in EDINET reports) --------- #
+    # Japanese securities reports tag reportable-segment (and geographic) figures
+    # as dimensional facts: the member is baked into the context id, e.g.
+    #   CurrentQuarterDuration_jpcrp040300-q2r_E01777-000MusicReportableSegmentMember
+    # We read the year-to-date value per member (CurrentYTDDuration for a
+    # quarterly report, CurrentYearDuration for an annual) and de-cumulate to
+    # discrete quarters — exactly like the main flow metrics. The element id
+    # varies by filer, so we pick it heuristically by local-name.
+    @staticmethod
+    def _seg_score(localname: str, want: str) -> int:
+        """Rank how well an element local-name fits the wanted segment metric.
+        0 = not a match. Higher = better (external revenue beats total; a plain
+        operating-income tag beats nothing)."""
+        ln = localname
+        low = ln.lower()
+        if want == "revenue":
+            if "intersegment" in low:
+                return 0
+            if not any(k in low for k in ("revenue", "sales", "netsales")):
+                return 0
+            if "tocustomers" in low or "external" in low:
+                return 3          # revenue to external customers (what we want)
+            if low.startswith("netsales") or low.startswith("revenue") or low.startswith("sales"):
+                return 2
+            return 1              # e.g. total incl. intersegment — last resort
+        else:  # operating income
+            if "intersegment" in low:
+                return 0
+            if "operatingincome" in low or "operatingprofit" in low:
+                return 3
+            if "segmentincome" in low or "segmentprofit" in low:
+                return 2
+            return 0
+
+    def _segment_ytd(self, doc, member_substr, want, is_annual):
+        """Best YTD (or full-year) value for a segment/geo member in one report."""
+        text = self._csv_text(doc)
+        rows = list(csv.reader(io.StringIO(text), delimiter="\t"))
+        hdr = rows[0]
+        eid, ctxi, vali = hdr.index("要素ID"), hdr.index("コンテキストID"), hdr.index("値")
+        period = "CurrentYearDuration" if is_annual else "CurrentYTDDuration"
+        pref = period + "_"
+        sub = member_substr.lower()
+        best_v, best_s = None, 0
+        for r in rows[1:]:
+            if len(r) <= vali:
+                continue
+            ctx = r[ctxi]
+            if not ctx.startswith(pref):
+                continue
+            mem = ctx[len(pref):]
+            if "member" not in mem.lower() or sub not in mem.lower():
+                continue
+            score = self._seg_score(r[eid].split(":")[-1], want)
+            if score <= best_s:
+                continue
+            try:
+                best_v, best_s = float(r[vali]), score
+            except ValueError:
+                continue
+        return best_v
+
+    def segment_quarterly(self, api_id, fye_month, years, member_substr, want):
+        """Discrete-quarter {(cal_y, cal_q): value} for a reportable-segment or
+        geographic member. `want` is 'revenue' or 'opincome'."""
+        if not self.available:
+            return {}
+        sec5 = api_id.strip()
+        if len(sec5) == 4:
+            sec5 += "0"
+        yrs = (sorted(set(int(y) for y in years)) if years
+               else range(2018, datetime.date.today().year + 1))
+        docs = self._discover(sec5, fye_month, yrs)
+        ytd = {}
+        for pe_iso, (doc, is_annual) in docs.items():
+            try:
+                v = self._segment_ytd(doc, member_substr, want, is_annual)
+            except Exception:
+                v = None
+            if v is not None:
+                ytd[pe_iso] = v
+        if not ytd:
+            return {}
+        from collections import defaultdict
+        groups = defaultdict(dict)
+        for pe_iso, v in ytd.items():
+            pe = datetime.date.fromisoformat(pe_iso)
+            fye = _month_last_day(pe.year + (pe.month > fye_month), fye_month)
+            mdist = (fye.year - pe.year) * 12 + (fye.month - pe.month)
+            qidx = 4 - mdist // 3
+            groups[fye][qidx] = (pe, v)
+        out = {}
+        for q_map in groups.values():
+            for q in (1, 2, 3, 4):
+                if q not in q_map:
+                    continue
+                pe, v = q_map[q]
+                if q == 1:
+                    disc = v
+                elif (q - 1) in q_map:
+                    disc = v - q_map[q - 1][1]
+                else:
+                    continue
+                out[cal_key_from_date(pe.isoformat())] = disc
+        return out
+
 
 # ---- Japan: J-Quants V2 (recent quarters, from TDnet 決算短信) ------------- #
 class JQuantsSource(Source):
@@ -1025,33 +1131,54 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
                                        + (f" (mapped name: {mapping[cid]})"
                                           if mapping.get(cid) else ""))
                         results.append(rec); continue
-                    if comp["market"] != "us":
-                        rec["status"] = "UNSUPPORTED_SEGMENT"
-                        rec["note"] = "segment/geo pilot is US-only for now (see README)"
-                        results.append(rec); continue
+                    market = comp["market"]
                     label = re.sub(r"^\d{4}Q\d_", "", rec["segment_code"]).strip()
                     is_geo = logical.startswith("Seg_Geo")
-                    axis_kw = "Geograph" if is_geo else "Segment"
-                    tags = (EdgarDimensional.OPINC_TAGS
-                            if logical.endswith("Operating_Income")
-                            else EdgarDimensional.REV_TAGS)
-                    member = seg_members.get((cid, label.upper()))
-                    if not member and is_geo:
-                        member = GEO_MEMBER.get(label.upper())
-                    if not member:
-                        rec["status"] = "NO_SEGMENT_MAPPING"
-                        rec["note"] = f"map '{label}' in config/segment_members.csv"
-                        results.append(rec); continue
+                    want = ("opincome" if logical.endswith("Operating_Income")
+                            else "revenue")
                     fv_raw = (rec["file_value"] or row.get("financial_value", "")
                               or row.get("financial_report_value", ""))
                     try:
                         fv = float(str(fv_raw).replace(",", ""))
                     except ValueError:
                         rec["status"] = "BAD_FILE_VALUE"; results.append(rec); continue
+                    rec["file_value"] = fv
+
+                    # Korea / Taiwan: segment & geographic figures live only in
+                    # the filing notes/footnotes (주석 / TIFRS 附註), which no free
+                    # API exposes as structured data — so we can't reconcile them.
+                    if market in ("kr", "tw"):
+                        rec["status"] = "SEGMENT_SOURCE_UNAVAILABLE"
+                        rec["note"] = (f"{market.upper()} segment/geo is footnote-only; "
+                                       "not in the free API (see README)")
+                        results.append(rec); continue
+
+                    member = seg_members.get((cid, label.upper()))
+                    if not member and is_geo and market == "us":
+                        member = GEO_MEMBER.get(label.upper())   # ISO codes: US only
+                    if not member:
+                        rec["status"] = "NO_SEGMENT_MAPPING"
+                        rec["note"] = (f"map '{label}' in config/segment_members.csv"
+                                       + (" (JP: a substring of the EDINET member "
+                                          "local-name)" if market == "jp" else ""))
+                        results.append(rec); continue
+
                     try:
-                        cik = sources["us"]._resolve_cik(comp["api_id"])
-                        ser = edgar_dim.series(cik, tags, axis_kw, member,
-                                               years_by_company.get(cid))
+                        if market == "us":
+                            tags = (EdgarDimensional.OPINC_TAGS if want == "opincome"
+                                    else EdgarDimensional.REV_TAGS)
+                            axis_kw = "Geograph" if is_geo else "Segment"
+                            cik = sources["us"]._resolve_cik(comp["api_id"])
+                            ser = edgar_dim.series(cik, tags, axis_kw, member,
+                                                   years_by_company.get(cid))
+                        elif market == "jp":
+                            ser = sources["jp"].ed.segment_quarterly(
+                                comp["api_id"], comp["fye_month"],
+                                years_by_company.get(cid), member, want)
+                        else:
+                            rec["status"] = "UNSUPPORTED_SEGMENT"
+                            rec["note"] = f"no segment source for market {market}"
+                            results.append(rec); continue
                         api_local = ser.get((int(cy), int(cq)))
                         if api_local is None:
                             rec["status"] = "MISSING_IN_API"
@@ -1059,7 +1186,6 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
                                            "(annual-only disclosure or period absent)")
                             results.append(rec); continue
                         status, api_m = compare(fv, api_local, False)
-                        rec["file_value"] = fv
                         rec["api_value_local"] = api_local
                         rec["api_value_millions"] = round(api_m, 3)
                         rec["status"] = status

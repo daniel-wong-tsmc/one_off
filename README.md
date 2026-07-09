@@ -5,12 +5,12 @@ and Japan** from free official/near-official APIs and reconciles them against
 your local CSV files, then reports **which company, for which metric and period,
 does not match**.
 
-| Market | Source | Key needed | Coverage in v1 |
-|--------|--------|-----------|----------------|
-| 🇺🇸 US | SEC EDGAR | none (User-Agent only) | quarterly, full history |
-| 🇰🇷 Korea | OpenDART | `DART_KEY` (free) | quarterly, full history |
-| 🇹🇼 Taiwan | FinMind | `FINMIND_TOKEN` optional | quarterly, full history |
-| 🇯🇵 Japan | J-Quants V2 + EDINET | `JQUANTS_KEY`, `EDINET_KEY` (free) | quarterly recent ~2yr (J-Quants) + pre-2024 quarterly & annual (EDINET 四半期/有価証券報告書) |
+| Market | Source | Key needed | Coverage | Segment/geo |
+|--------|--------|-----------|----------|-------------|
+| 🇺🇸 US | SEC EDGAR | none (User-Agent only) | quarterly, full history | ✅ EDGAR dimensional XBRL |
+| 🇰🇷 Korea | OpenDART | `DART_KEY` (free) | quarterly, full history | ⛔ footnote-only, no free API |
+| 🇹🇼 Taiwan | FinMind | `FINMIND_TOKEN` optional | quarterly, full history | ⛔ footnote-only, no free API |
+| 🇯🇵 Japan | J-Quants V2 + EDINET | `JQUANTS_KEY`, `EDINET_KEY` (free) | quarterly recent ~2yr (J-Quants) + pre-2024 quarterly & annual (EDINET 四半期/有価証券報告書) | ✅ EDINET dimensional XBRL |
 
 ## Setup
 
@@ -96,8 +96,8 @@ Outputs:
 | `UNSUPPORTED_DERIVED` | computed ratio / turnover-days / QoQ-delta metric (e.g. `NET_MARGIN`, `CASH_CONVERSION_CYCLE`, `*_QOQ`) — not a single as-filed line item, so not reconcilable against one API field |
 | `COMPANY_NOT_CONFIGURED` | `company_id` not in `company_registry.csv` |
 | `UNSUPPORTED_METRIC` | that market's source doesn't expose that metric |
-| `UNSUPPORTED_SEGMENT` | segment/geo row for a non-US company (pilot is US-only) |
-| `NO_SEGMENT_MAPPING` | US segment/geo label not resolvable — add to `segment_members.csv` |
+| `SEGMENT_SOURCE_UNAVAILABLE` | segment/geo row for **Korea or Taiwan** — that data is footnote-only and not in any free API |
+| `NO_SEGMENT_MAPPING` | US/JP segment/geo label not resolvable — add to `segment_members.csv` |
 | `SOURCE_UNAVAILABLE` | key missing for that market |
 | `BAD_FILE_VALUE` / `ERROR` | unparseable value / fetch error |
 
@@ -120,25 +120,36 @@ Outputs:
   - Any period neither source can reach (older than the J-Quants window *and*
     with no EDINET filing) returns `MISSING_IN_API`. Because the J-Quants free
     window rolls forward, cache older quarters sooner rather than later.
-- **Segment & geographic files — US pilot only.** The `Seg_*` files hold
-  business-segment and geographic splits, which live in filing footnotes rather
-  than clean top-line API fields.
-  - **US (EDGAR) is fully implemented for all four `Seg_*` files.** Values are
-    read as *dimensional* XBRL facts from the filing instances (`Revenues` /
+- **Segment & geographic files (`Seg_*`) — US and Japan supported; Korea and
+  Taiwan not available via free API.** These files hold business-segment and
+  geographic splits, which live in filing footnotes rather than clean top-line
+  API fields.
+  - **US (EDGAR).** Dimensional XBRL facts from the filing instances (`Revenues` /
     `OperatingIncomeLoss` on `StatementBusinessSegmentsAxis` /
-    `StatementGeographicalAxis`, with the standard `OperatingSegmentsMember`
-    qualifier handled), at discrete quarterly granularity from 10-Qs.
-    Geographic *country* labels resolve via a built-in map (China→CN, US→US,
-    Taiwan→TW, …); business segments and custom regions are mapped per company
-    in `config/segment_members.csv`. Verified on Qorvo: **segment revenue,
-    segment operating income, and geographic revenue** (US/China/Taiwan) all
-    match at quarterly granularity. Geographic *operating income* is usually not
-    disclosed by US filers, so those rows come back `MISSING_IN_API` — expected,
-    not a tool gap.
-  - **Japan / Korea / Taiwan segment/geo are not yet built** — those rows return
-    `UNSUPPORTED_SEGMENT`. In Japan much of this sits in XBRL text blocks
-    (Socionext's geographic revenue is prose, and it's single-segment); KR/TW
-    need note parsing.
+    `StatementGeographicalAxis`, with the `OperatingSegmentsMember` qualifier
+    handled), at discrete quarterly granularity from 10-Qs. Geographic *country*
+    labels resolve via a built-in map (China→CN, US→US, Taiwan→TW, …); business
+    segments and custom regions are mapped per company in
+    `config/segment_members.csv`. Verified on Qorvo (segment revenue, segment
+    operating income, geographic revenue). Geographic *operating income* is
+    usually not disclosed by US filers → `MISSING_IN_API` (expected).
+  - **Japan (EDINET).** Reportable-segment and geographic figures are dimensional
+    XBRL in the securities reports — the member is encoded in the context id
+    (e.g. `CurrentQuarterDuration_…GameAndNetworkServicesReportableSegmentMember`).
+    The tool reads the year-to-date value per member and **de-cumulates to
+    discrete quarters** (the revenue/operating-income element is picked
+    heuristically by name; external "to customers" revenue is preferred). Map
+    each label to a **substring of its XBRL member** in `segment_members.csv`
+    (e.g. `301,Game & Network Services,GameAndNetworkServices`). Verified on Sony
+    (Game/Music segment revenue and operating income, discrete quarters summing
+    to the annual). *Caveats:* single-segment filers and post-April-2024 periods
+    (no more 四半期 reports) yield little/no structured segment data.
+  - **Korea / Taiwan.** Segment/geographic data is **footnote-only** (KR 주석; TW
+    TIFRS 附註) and exposed by **no free API** — OpenDART, FinMind and the TWSE
+    OpenAPI all stop at the primary statements. Those rows return
+    `SEGMENT_SOURCE_UNAVAILABLE`. Reconciling them would need an HTML/PDF footnote
+    extractor (KR: OpenDART `document.xml`; TW: MOPS TIFRS report) or a paid feed
+    (TEJ / Capital IQ / Refinitiv).
 - **Metric coverage.** Income statement: revenue, COGS, gross profit, operating
   income, pre-tax income, net income, basic & diluted EPS. Balance sheet: current
   assets, total assets, accounts payable, current liabilities, total liabilities,

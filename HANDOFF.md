@@ -33,8 +33,10 @@ The user has all three keys — ask them to paste them; **never commit keys**
 - `FA.csv` — `company_id;fiscal_year;fiscal_quarter;calendar_year;calendar_quarter;financial_code;financial_value;financial_report_value`
 - `Seg_Seg_Revenue`, `Seg_Seg_Operating_Income` — business segments; `...;segment_code;financial_code;financial_value;financial_report_value`
 - `Seg_Geo_Revenue`, `Seg_Geo_Operating_Income` — geographic; same columns
-- `company_id_mapping` — `company_id;external_mapped_name` (**not consumed by the script yet**)
-- There is a **7th file the user never described** — unknown.
+- `company_id_mapping` — `company_id;external_mapped_name` (now auto-consumed)
+
+The user confirmed there are **exactly six files** (the five above + `company_id_mapping`);
+the earlier "7th unknown file" was a miscount — there is no 7th file.
 
 `segment_code` looks like `2020Q2_China` / `2020Q1_Semiconductors` — the code
 strips the leading `\d{4}Q\d_` and uses the remaining label. Some Seg rows have
@@ -52,13 +54,19 @@ only `financial_value` (no `financial_report_value`).
   - `JQuantsSource` (JP) — V2 `/fins/summary` (TDnet 決算短信); YTD values de-cumulated; free plan = rolling ~2yr + ~12-week delay.
   - `JapanSource` — composite: EDINET (history) + J-Quants (recent), J-Quants wins on overlap.
 - `run()` — per row: resolve company (registry) → map financial_code (metric_map) → fetch (memoized per company/metric, only needed years) → normalize to millions (÷1e6; per-share direct) → compare (1% money, ±0.02 EPS) → status.
-- Segment rows are routed to `EdgarDimensional` for US; non-US → `UNSUPPORTED_SEGMENT`.
+- Segment rows are routed by market: US → `EdgarDimensional`; JP →
+  `EdinetSource.segment_quarterly` (dimensional segment/geo facts from EDINET
+  reports, de-cumulated); KR/TW → `SEGMENT_SOURCE_UNAVAILABLE` (footnote-only,
+  no free API).
 
 ## Config (user-editable, drives everything)
 
 - `config/company_registry.csv` — `company_id → market, api_id, fye_month, name`. **Required.** api_id = ticker/CIK (us), KRX code (kr), TWSE code (tw), sec code (jp).
 - `config/metric_map.csv` — `financial_code → canonical_metric`. Only common codes seeded; unmapped → `NO_MAPPING`.
-- `config/segment_members.csv` — `(company_id, label) → XBRL member` for US business segments / custom regions (country geo is built-in via `GEO_MEMBER`).
+- `config/segment_members.csv` — `(company_id, label) → XBRL member`. US: exact
+  member local-name for business segments / custom regions (country geo is
+  built-in via `GEO_MEMBER`). JP: a **substring** of the EDINET member local-name
+  (e.g. `GameAndNetworkServices`).
 
 ## Verified working (self-test, live)
 
@@ -69,9 +77,9 @@ Marketech 6196 (TW), Socionext 6526 (JP).
 
 | | US | KR | TW | JP |
 |---|---|---|---|---|
-| Income statement (rev/op-inc/net-inc/EPS) | ✅ | ✅ | ✅ | ✅ (EPS recent-only, J-Quants) |
-| Balance sheet | ✅ | ✅ | ✅ | ✅ |
-| Segment / geo (4 files) | ✅ | — | — | — |
+| Income statement (rev/COGS/op-inc/pre-tax/net-inc/EPS) | ✅ | ✅ | ✅ | ✅ (EPS recent-only, J-Quants; diluted EPS n/a) |
+| Balance sheet (assets/liabs/equity) | ✅ | ✅ | ✅ | ✅ |
+| Segment / geo (4 files) | ✅ | ⛔ footnote-only | ⛔ footnote-only | ✅ (EDINET dimensional XBRL) |
 
 ## Key assumptions — ✅ NOW VALIDATED against real sample rows
 
@@ -114,26 +122,36 @@ core assumptions checked out:
 
 ## Not done / next steps (roughly by value)
 
-1. **Calibrate against the user's real data** — units, compare column, quarter
-   semantics. Nothing has run on the actual files.
-2. ~~**Wire `company_id_mapping`**~~ **DONE.** `load_company_mapping()` +
-   `find_mapping_file()` auto-load `<data-dir>/company_id_mapping` (`.csv`
-   suffix optional; `--mapping-file` to override). It fills `company_name` in
-   the output and prints a **"COMPANIES TO CONFIGURE"** to-do list of ids seen
-   in the data but absent from `company_registry.csv` (with mapped names). It
-   still does NOT resolve name → market/api_id (unreliable); the user fills
-   those. Validated on synthetic data; not yet seen against the real mapping.
-3. **Japan segment/geo** — hard: much is XBRL **text-block prose** (Socionext's
-   geographic revenue is a text block; it's single-segment with no business
-   split). Expect partial results.
-4. **Korea / Taiwan segment/geo** — footnote parsing; no clean API. Hardest.
-5. **Expand `metric_map` + per-source element/field maps** — only rev/op-inc/
-   net-inc/EPS + a few balance-sheet items are wired. Add more `financial_code`s
-   as they appear in the real `FA.csv` (we only ever saw `ACCOUNTS_PAYABLE`).
-6. **Identify the 7th data file.**
-7. **Full-run performance** — EDINET date-scanning is slow for many JP companies
-   × many years on first run (cached after). Consider a prebuilt EDINET doc
-   index if the JP universe is large.
+1. ~~**Calibrate against real data**~~ **DONE** (see "Key assumptions" above).
+2. ~~**Wire `company_id_mapping`**~~ **DONE.** Auto-loads the mapping, fills
+   `company_name`, prints a "COMPANIES TO CONFIGURE" to-do list. Still doesn't
+   resolve name → market/api_id (unreliable); the user fills those.
+3. ~~**Japan segment/geo**~~ **DONE (structured path).** JP reportable-segment
+   (and geographic) figures ARE dimensional XBRL in EDINET securities reports —
+   the member is baked into the context id (e.g. `CurrentQuarterDuration_...
+   GameAndNetworkServicesReportableSegmentMember`). `EdinetSource.segment_quarterly`
+   reads the YTD value per member and de-cumulates to discrete quarters (element
+   id picked heuristically by local-name; external "ToCustomers" revenue preferred).
+   Validated on Sony (Game/Music segment revenue + operating income, discrete
+   quarters summing to the annual). Members are mapped per company in
+   `segment_members.csv` (JP member = a substring of the XBRL member local-name).
+   Caveat: single-segment filers (Socionext) and post-Apr-2024 periods (no more
+   四半期 reports) have little/no structured segment data → partial coverage.
+4. **Korea / Taiwan segment/geo** — confirmed **not available via any free API**:
+   the data lives only in filing notes/footnotes (KR 주석 / TW TIFRS 附註), not in
+   OpenDART's or FinMind's/TWSE's statement endpoints. Those rows now return
+   `SEGMENT_SOURCE_UNAVAILABLE`. Building it would require an HTML/PDF footnote
+   extractor (KR: OpenDART `document.xml` DS001; TW: MOPS TIFRS report) or a paid
+   feed (TEJ / Capital IQ / Refinitiv) — deferred by design.
+5. **Expand `metric_map` + per-source field maps** — income statement (rev, COGS,
+   gross profit, op-inc, pre-tax, net-inc, basic/diluted EPS) and balance sheet
+   (current/total assets, A/P, current/total liabilities, equity) are wired with
+   verified field names. Add more `financial_code`s as new ones appear.
+6. **Full-run performance** — EDINET date-scanning is slow for many JP companies
+   × years on first run (cached after), and now segment extraction adds more
+   report fetches. Consider a prebuilt EDINET doc index if the JP universe is
+   large. (Cold-cache runs can transiently miss a JP report; a warm-cache re-run
+   fixes it.)
 
 ## Gotchas / lessons
 
