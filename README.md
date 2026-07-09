@@ -8,7 +8,7 @@ does not match**.
 | Market | Source | Key needed | Coverage | Segment/geo |
 |--------|--------|-----------|----------|-------------|
 | 🇺🇸 US | SEC EDGAR | none (User-Agent only) | quarterly, full history | ✅ EDGAR dimensional XBRL |
-| 🇰🇷 Korea | OpenDART | `DART_KEY` (free) | quarterly, full history | 🟡 geographic revenue (all four quarters) from the DART note tables |
+| 🇰🇷 Korea | OpenDART | `DART_KEY` (free) | quarterly, full history | 🟡 geographic **and** business-segment revenue (all 4 quarters) from the DART note tables |
 | 🇹🇼 Taiwan | FinMind | `FINMIND_TOKEN` optional | quarterly, full history | ⛔ footnote-only (MOPS TIFRS PDF), no free API |
 | 🇯🇵 Japan | J-Quants V2 + EDINET | `JQUANTS_KEY`, `EDINET_KEY` (free) | quarterly recent ~2yr (J-Quants) + pre-2024 quarterly & annual (EDINET 四半期/有価証券報告書) | ✅ EDINET dimensional XBRL |
 
@@ -155,11 +155,15 @@ Outputs:
     and region names are mapped both country-level and continent-level
     (중국/China, 한국/Korea, 미국/US, 북미/NorthAmerica, 유럽/Europe, 중남미/LatAm, …).
     Verified on DB HiTek: China/Korea/US/Japan quarterly geographic revenue,
-    including the Q4 derivation. *Scope:* geographic **operating income** isn't
-    broken out by region in KR filings → `MISSING_IN_API`; **business-segment**
-    (영업부문) splits are **not** reconciled (`UNSUPPORTED_SEGMENT`) — those note
-    tables are too filer-variable to parse reliably, and most KR filers here are
-    single-segment anyway.
+    including the Q4 derivation. **Business-segment revenue** (영업부문/보고부문) is
+    also reconciled for all four quarters: the reportable-segment note table
+    (consolidated) is read at its discrete 당분기(3개월) table (Q1–Q3) and derived
+    as annual − 9-month for Q4; segment labels are mapped to the note's 부문 name
+    in `segment_members.csv` (e.g. `Semiconductors → DS`). Verified on Samsung
+    Electronics: DX / DS / SDC / Harman quarterly segment revenue, with the
+    discrete quarters summing exactly to the disclosed 9-month figure and FY2023
+    DS = ₩66.59 tn matching the filing. *Scope:* segment/geographic **operating
+    income** is skipped (not consistently disclosed) → `MISSING_IN_API`.
   - **Taiwan.** Segment/geographic data is **footnote-only** (TIFRS 附註, PDF/HTML
     on MOPS) and exposed by **no free API** — FinMind and the TWSE OpenAPI stop at
     the primary statements. Those rows return `SEGMENT_SOURCE_UNAVAILABLE`.

@@ -57,9 +57,9 @@ only `financial_value` (no `financial_report_value`).
 - Segment rows are routed by market: US → `EdgarDimensional`; JP →
   `EdinetSource.segment_quarterly` (dimensional segment/geo facts from EDINET
   reports, de-cumulated); KR → `OpenDartSource.segment_quarterly` (parses the
-  영업부문 note tables from `document.xml`; geographic revenue all four quarters);
-  TW → `SEGMENT_SOURCE_UNAVAILABLE` (footnote-only MOPS PDF, no free API). KR
-  business-segment rows → `UNSUPPORTED_SEGMENT` (note tables too filer-variable).
+  영업부문/보고부문 note tables from `document.xml`; geographic AND business-segment
+  revenue, all four quarters); TW → `SEGMENT_SOURCE_UNAVAILABLE` (footnote-only
+  MOPS PDF, no free API).
 
 ## Config (user-editable, drives everything)
 
@@ -81,7 +81,7 @@ Marketech 6196 (TW), Socionext 6526 (JP).
 |---|---|---|---|---|
 | Income statement (rev/COGS/op-inc/pre-tax/net-inc/EPS) | ✅ | ✅ | ✅ | ✅ (EPS recent-only, J-Quants; diluted EPS n/a) |
 | Balance sheet (assets/liabs/equity) | ✅ | ✅ | ✅ | ✅ |
-| Segment / geo (4 files) | ✅ | 🟡 geo revenue all 4 qtrs (DART notes) | ⛔ footnote-only (MOPS PDF) | ✅ (EDINET dimensional XBRL) |
+| Segment / geo (4 files) | ✅ | 🟡 geo + segment revenue, all 4 qtrs (DART notes) | ⛔ footnote-only (MOPS PDF) | ✅ (EDINET dimensional XBRL) |
 
 ## Key assumptions — ✅ NOW VALIDATED against real sample rows
 
@@ -149,12 +149,15 @@ core assumptions checked out:
    **Q4 = annual − 9-month cumulative**, where the annual (사업보고서) note uses a
    **transposed** regions-as-columns layout (handled). Validated on DB HiTek:
    China 2023 Q1–Q4 (162,798 / 169,257 / 167,085 / 166,475 백만원) all exact.
-   **Scope decisions:** geo **operating income** isn't disclosed by region in KR
-   filings (→ MISSING); **business-segment** (영업부문) rows → `UNSUPPORTED_SEGMENT`
-   — those note tables are too filer-variable to parse reliably (labels are
-   H&A/HE/VS vs 본부; overview-vs-note; transposed), and shipping fragile extraction
-   into a reconciliation tool risks a false MATCH; most KR filers here are
-   single-segment anyway. (If needed later, build per-company segment mapping.)
+   **Business-segment revenue** also works: `_segment_revenue` reads the
+   reportable-segment (보고부문) note — the discrete 당분기(3개월) table for Q1–Q3 and
+   annual − 9-month for Q4 — with unit handling and label→부문 mapping via
+   `segment_members.csv`. `_note_windows` tries every anchor occurrence in document
+   order so the CONSOLIDATED (연결) note is preferred over the separate (별도) one,
+   and the annual (single 당기 table, no 3개월/누적 split) is handled. Validated on
+   Samsung (DX/DS/SDC/Harman): discrete quarters sum exactly to the 9-month figure,
+   and FY2023 DS = ₩66.59 tn matches the filing. **Skipped by request:** segment &
+   geographic **operating income** (not consistently disclosed) → MISSING.
 5. **Taiwan segment/geo** — **not available via any free API** (probed concretely,
    not just researched):
    - TWSE OpenAPI `t187ap06_*` and FinMind `TaiwanStockFinancialStatements` are

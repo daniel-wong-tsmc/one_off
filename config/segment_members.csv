@@ -20,9 +20,11 @@ company_id,label,member
 #
 # Korea (OpenDART notes): geographic revenue matches by region name automatically
 # (no mapping needed; country- and continent-level names are recognised). Add a
-# row only to alias an unusual region label to a known one, e.g.
-# 103,Greater China,중국
-# KR business-segment (영업부문) rows are not reconciled (UNSUPPORTED_SEGMENT).
+# geo row only to alias an unusual region label, e.g. 103,Greater China,중국.
+# BUSINESS segments: `member` is the 부문 name used in the reportable-segment
+# (보고부문) note, matched as a substring, e.g. Samsung Electronics:
+# 201,Semiconductors,DS
+# 201,Device eXperience,DX
 #
 # Taiwan: segment/geo is footnote-only (MOPS TIFRS PDF) and not in any free API,
 # so those rows report SEGMENT_SOURCE_UNAVAILABLE regardless of what is mapped here.
