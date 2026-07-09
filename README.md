@@ -92,10 +92,11 @@ Outputs:
     Quarterly reports are discovered by scanning the statutory filing window
     after each period end (slow on first run for a company, then cached), and
     their year-to-date XBRL values are de-cumulated into discrete quarters.
-  - **EDINET quarterly covers revenue / operating income / net income only.**
-    EPS is intentionally excluded there: year-to-date EPS is restated across
-    stock splits (e.g. Socionext FY2024), so differencing it is invalid. Japan
-    EPS therefore comes from J-Quants (recent quarters) only.
+  - **EDINET covers revenue / operating income / net income** (de-cumulated)
+    **and balance-sheet items** (total assets, trade payables, net assets — read
+    at instant contexts, point-in-time). **EPS is intentionally excluded**:
+    year-to-date EPS is restated across stock splits (e.g. Socionext FY2024), so
+    differencing it is invalid. Japan EPS comes from J-Quants (recent quarters).
   - Any period neither source can reach (older than the J-Quants window *and*
     with no EDINET filing) returns `MISSING_IN_API`. Because the J-Quants free
     window rolls forward, cache older quarters sooner rather than later.

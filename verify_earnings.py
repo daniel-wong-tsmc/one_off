@@ -330,7 +330,7 @@ class FinMindSource(Source):
         "EPS_BASIC": (IS, "EPS"),
         "ACCOUNTS_PAYABLE": (BS, "AccountsPayable"),
         "TOTAL_ASSETS": (BS, "TotalAssets"),
-        "TOTAL_EQUITY": (BS, "TotalEquity"),
+        "TOTAL_EQUITY": (BS, "Equity"),
     }
 
     def __init__(self):
@@ -372,9 +372,14 @@ class EdinetSource(Source):
     # YTD EPS is restated across stock splits, so differencing it is invalid
     # (Japan EPS comes from J-Quants for recent quarters instead).
     metric_map = {
+        # flow (income statement): read at *Duration contexts, de-cumulated
         "REVENUE": "jppfs_cor:NetSales",
         "OPERATING_INCOME": "jppfs_cor:OperatingIncome",
         "NET_INCOME": "jppfs_cor:ProfitLossAttributableToOwnersOfParent",
+        # stock (balance sheet): read at *Instant contexts, point-in-time
+        "ACCOUNTS_PAYABLE": "jppfs_cor:AccountsPayableTrade",
+        "TOTAL_ASSETS": "jppfs_cor:Assets",
+        "TOTAL_EQUITY": "jppfs_cor:NetAssets",
     }
     note = ""
 
@@ -444,7 +449,10 @@ class EdinetSource(Source):
         hdr = rows[0]
         eid, ctxi, vali = hdr.index("要素ID"), hdr.index("コンテキストID"), hdr.index("値")
         elt = self.metric_map[metric]
-        ctx = "CurrentYearDuration" if is_annual else "CurrentYTDDuration"
+        if CANONICAL[metric]["kind"] == "stock":   # balance sheet: point-in-time
+            ctx = "CurrentYearInstant" if is_annual else "CurrentQuarterInstant"
+        else:                                       # income statement: period flow
+            ctx = "CurrentYearDuration" if is_annual else "CurrentYTDDuration"
         for r in rows[1:]:
             if r[eid] == elt and r[ctxi] == ctx and "NonConsolidated" not in r[ctxi]:
                 try:
@@ -462,7 +470,15 @@ class EdinetSource(Source):
         yrs = (sorted(set(int(y) for y in years)) if years
                else range(2018, datetime.date.today().year + 1))
         docs = self._discover(sec5, fye_month, yrs)
-        # period-end -> YTD (quarterly) / full-year (annual) value for this metric
+        # stock (balance sheet): each report gives the period-end balance directly
+        if CANONICAL[metric]["kind"] == "stock":
+            out = {}
+            for pe_iso, (doc, is_annual) in docs.items():
+                v = self._report_value(doc, metric, is_annual)
+                if v is not None:
+                    out[cal_key_from_date(pe_iso)] = v
+            return out
+        # flow (income statement): period-end -> YTD, de-cumulated below
         ytd = {}
         for pe_iso, (doc, is_annual) in docs.items():
             v = self._report_value(doc, metric, is_annual)
