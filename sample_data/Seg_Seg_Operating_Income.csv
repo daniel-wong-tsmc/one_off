@@ -1,0 +1,4 @@
+company_id;calendar_year;calendar_quarter;segment_code;financial_code;financial_value;financial_report_value
+101;2025;4;2025Q4_HPA;SEG_OPERATING_INCOME;55.723;55.723
+101;2025;4;2025Q4_CSG;SEG_OPERATING_INCOME;-6.244;-6.244
+101;2025;4;2025Q4_ACG;SEG_OPERATING_INCOME;202.168;202.168

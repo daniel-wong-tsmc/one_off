@@ -104,14 +104,18 @@ Outputs:
 - **Segment & geographic files — US pilot only.** The `Seg_*` files hold
   business-segment and geographic splits, which live in filing footnotes rather
   than clean top-line API fields.
-  - **US (EDGAR) is implemented**: segment/geo values are read as *dimensional*
-    XBRL facts from the filing instances (`Revenues` / `OperatingIncomeLoss` on
-    `StatementBusinessSegmentsAxis` / `StatementGeographicalAxis`), at discrete
-    quarterly granularity from 10-Qs. Geographic *country* labels resolve via a
-    built-in map (China→CN, US→US, Taiwan→TW, …); business segments and custom
-    regions are mapped per company in `config/segment_members.csv`. Verified on
-    Qorvo (US/China/Taiwan revenue). Geographic *operating income* is usually
-    not disclosed, so those rows typically come back `MISSING_IN_API`.
+  - **US (EDGAR) is fully implemented for all four `Seg_*` files.** Values are
+    read as *dimensional* XBRL facts from the filing instances (`Revenues` /
+    `OperatingIncomeLoss` on `StatementBusinessSegmentsAxis` /
+    `StatementGeographicalAxis`, with the standard `OperatingSegmentsMember`
+    qualifier handled), at discrete quarterly granularity from 10-Qs.
+    Geographic *country* labels resolve via a built-in map (China→CN, US→US,
+    Taiwan→TW, …); business segments and custom regions are mapped per company
+    in `config/segment_members.csv`. Verified on Qorvo: **segment revenue,
+    segment operating income, and geographic revenue** (US/China/Taiwan) all
+    match at quarterly granularity. Geographic *operating income* is usually not
+    disclosed by US filers, so those rows come back `MISSING_IN_API` — expected,
+    not a tool gap.
   - **Japan / Korea / Taiwan segment/geo are not yet built** — those rows return
     `UNSUPPORTED_SEGMENT`. In Japan much of this sits in XBRL text blocks
     (Socionext's geographic revenue is prose, and it's single-segment); KR/TW

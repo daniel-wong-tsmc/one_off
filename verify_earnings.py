@@ -246,8 +246,12 @@ class EdgarDimensional:
             out.add((acc, doc))
         return out
 
+    # extra axes allowed alongside a segment/geo breakdown (value must match).
+    # OperatingSegmentsMember is the standard qualifier on segment tables.
+    QUALIFIERS = {"ConsolidationItemsAxis": "OperatingSegmentsMember"}
+
     def _facts(self, cik, acc, doc):
-        ck = f"edgar_dim_{acc}"
+        ck = f"edgar_dim2_{acc}"
         c = _cache_get(ck)
         if c is not None:
             return c
@@ -278,27 +282,35 @@ class EdgarDimensional:
                 if not cr or cr not in ctx:
                     continue
                 s, e, dims = ctx[cr]
-                if len(dims) != 1 or not s or not e:   # single-axis breakdowns only
+                if not s or not e or not dims:
                     continue
-                ax = next(iter(dims))
-                if "Segment" not in ax and "Geograph" not in ax:
+                if not any("Segment" in k or "Geograph" in k for k in dims):
                     continue
                 try:
                     val = float(el.text)
                 except (TypeError, ValueError):
                     continue
-                facts.append([_xloc(el.tag), s, e, ax, dims[ax], val])
+                facts.append([_xloc(el.tag), s, e, dims, val])
         except Exception:
             pass
         _cache_put(ck, facts)
         return facts
 
     def series(self, cik, tags, axis_kw, member, years):
-        """Discrete-quarter (~90d) dimensional values keyed by (cal_year, cal_q)."""
+        """Discrete-quarter (~90d) dimensional values keyed by (cal_year, cal_q).
+        Matches the target axis+member, allowing only the standard segment
+        qualifier axis alongside it (rejects product/geo cross-tabs, etc.)."""
         out = {}
         for acc, doc in self._filings(cik, years):
-            for tag, s, e, ax, mem, val in self._facts(cik, acc, doc):
-                if tag not in tags or axis_kw not in ax or mem != member:
+            for tag, s, e, dims, val in self._facts(cik, acc, doc):
+                if tag not in tags:
+                    continue
+                target = [k for k in dims if axis_kw in k]
+                if not target or dims[target[0]] != member:
+                    continue
+                extra_ok = all(k == target[0] or self.QUALIFIERS.get(k) == v
+                               for k, v in dims.items())
+                if not extra_ok:
                     continue
                 days = (datetime.date.fromisoformat(e) - datetime.date.fromisoformat(s)).days
                 if 85 <= days <= 95:
