@@ -357,99 +357,141 @@ class FinMindSource(Source):
         return out
 
 
-# ---- Japan: EDINET (annual-only in v1) ------------------------------------ #
+# ---- Japan: EDINET (annual + quarterly securities reports, XBRL) ---------- #
+def _month_last_day(y, m):
+    nxt = datetime.date(y + (m == 12), (m % 12) + 1, 1)
+    return nxt - datetime.timedelta(days=1)
+
+
 class EdinetSource(Source):
     market = "jp"
-    metric_map = {   # element-id -> annual value; quarterly not covered in v1
-        "REVENUE": "jpcrp_cor:NetSalesSummaryOfBusinessResults",
-        "NET_INCOME": "jpcrp_cor:ProfitLossAttributableToOwnersOfParentSummaryOfBusinessResults",
-        "EPS_BASIC": "jpcrp_cor:BasicEarningsLossPerShareSummaryOfBusinessResults",
+    # canonical -> XBRL element id. Read at CurrentYTDDuration (quarterly report)
+    # or CurrentYearDuration (annual securities report); YTD values de-cumulated.
+    # Only absolute-yen flow metrics: their YTD values de-cumulate exactly and
+    # are immune to share-count changes. EPS is deliberately excluded because
+    # YTD EPS is restated across stock splits, so differencing it is invalid
+    # (Japan EPS comes from J-Quants for recent quarters instead).
+    metric_map = {
+        "REVENUE": "jppfs_cor:NetSales",
         "OPERATING_INCOME": "jppfs_cor:OperatingIncome",
+        "NET_INCOME": "jppfs_cor:ProfitLossAttributableToOwnersOfParent",
     }
-    note = "EDINET provides annual securities-report data only in v1; " \
-           "quarterly reports were abolished for FYs starting Apr-2024. " \
-           "Quarterly JP rows report MISSING_IN_API."
+    note = ""
 
     def __init__(self):
         self.key = os.environ.get("EDINET_KEY")
         self.available = bool(self.key)
         if not self.key:
             self.note = "EDINET_KEY not set"
+        self._doc_index = {}   # (sec5, fye, years) -> {period_end_iso: (docID, is_annual)}
 
-    def _find_annual_doc(self, sec5: str):
-        """Scan recent June windows to find the latest annual securities report
-        (docTypeCode 120) for a 5-digit secCode."""
+    @staticmethod
+    def _quarter_end_months(fye_month):
+        return {((fye_month - 3 * i - 1) % 12) + 1 for i in range(4)}
+
+    def _list(self, date):
+        return _http_json(
+            f"https://api.edinet-fsa.go.jp/api/v2/documents.json?date={date}"
+            f"&type=2&Subscription-Key={self.key}", cache_key=f"edinet_list_{date}")
+
+    def _find_doc(self, sec5, period_end, is_annual):
+        """Scan the statutory filing window after a period end for the annual
+        (120) or quarterly (140) securities report of this company."""
+        lo, hi = (76, 96) if is_annual else (30, 50)   # ~3 months / ~45 days
+        want = "120" if is_annual else "140"
         today = datetime.date.today()
-        for year in range(today.year, today.year - 4, -1):
-            for day in range(15, 31):
-                date = f"{year}-06-{day:02d}"
-                if datetime.date.fromisoformat(date) > today:
-                    continue
-                lst = _http_json(
-                    f"https://api.edinet-fsa.go.jp/api/v2/documents.json?date={date}"
-                    f"&type=2&Subscription-Key={self.key}",
-                    cache_key=f"edinet_list_{date}")
-                for r in (lst or {}).get("results", []):
-                    if r.get("secCode") == sec5 and r.get("docTypeCode") == "120":
-                        return r.get("docID"), r.get("periodEnd")
-        return None, None
+        for d in range(lo, hi + 1):
+            date = period_end + datetime.timedelta(days=d)
+            if date > today:
+                break
+            for r in (self._list(date.isoformat()) or {}).get("results", []):
+                if r.get("secCode") == sec5 and r.get("docTypeCode") == want:
+                    return r.get("docID")
+        return None
 
-    def _annual_series(self, sec5):
-        doc, pend = self._find_annual_doc(sec5)
-        if not doc:
-            return {}
-        key = f"edinet_csv_{doc}"
-        cached = _cache_get(key)
-        if cached is None:
-            r = SESSION.get(
-                f"https://api.edinet-fsa.go.jp/api/v2/documents/{doc}"
-                f"?type=5&Subscription-Key={self.key}", timeout=120)
-            zf = zipfile.ZipFile(io.BytesIO(r.content))
-            name = [n for n in zf.namelist() if "asr" in n][0]
-            text = zf.read(name).decode("utf-16")
-            cached = {"text": text, "pend": pend}
-            _cache_put(key, cached)
-        return cached
+    def _discover(self, sec5, fye_month, years):
+        key = (sec5, fye_month, tuple(sorted(years)))
+        if key in self._doc_index:
+            return self._doc_index[key]
+        qmonths = self._quarter_end_months(fye_month)
+        docs = {}
+        for y in sorted(years):
+            for m in qmonths:
+                pe = _month_last_day(y, m)
+                is_annual = (m == fye_month)
+                doc = self._find_doc(sec5, pe, is_annual)
+                if doc:
+                    docs[pe.isoformat()] = (doc, is_annual)
+        self._doc_index[key] = docs
+        return docs
+
+    def _csv_text(self, doc):
+        ck = f"edinet_csvtext_{doc}"
+        c = _cache_get(ck)
+        if c is not None:
+            return c
+        r = SESSION.get(f"https://api.edinet-fsa.go.jp/api/v2/documents/{doc}"
+                        f"?type=5&Subscription-Key={self.key}", timeout=120)
+        zf = zipfile.ZipFile(io.BytesIO(r.content))
+        name = [n for n in zf.namelist() if "jpcrp" in n][0]  # main report, not audit
+        text = zf.read(name).decode("utf-16")
+        _cache_put(ck, text)
+        return text
+
+    def _report_value(self, doc, metric, is_annual):
+        text = self._csv_text(doc)
+        rows = list(csv.reader(io.StringIO(text), delimiter="\t"))
+        hdr = rows[0]
+        eid, ctxi, vali = hdr.index("要素ID"), hdr.index("コンテキストID"), hdr.index("値")
+        elt = self.metric_map[metric]
+        ctx = "CurrentYearDuration" if is_annual else "CurrentYTDDuration"
+        for r in rows[1:]:
+            if r[eid] == elt and r[ctxi] == ctx and "NonConsolidated" not in r[ctxi]:
+                try:
+                    return float(r[vali])
+                except ValueError:
+                    return None
+        return None
 
     def quarterly(self, api_id, metric, fye_month=12, years=None):
-        # v1: no reliable quarterly source -> signal MISSING for quarterly rows
-        return {}
-
-    def annual(self, api_id, metric):
         if not self.available:
             return {}
         sec5 = api_id.strip()
         if len(sec5) == 4:
             sec5 += "0"
-        blob = self._annual_series(sec5)
-        if not blob:
+        yrs = (sorted(set(int(y) for y in years)) if years
+               else range(2018, datetime.date.today().year + 1))
+        docs = self._discover(sec5, fye_month, yrs)
+        # period-end -> YTD (quarterly) / full-year (annual) value for this metric
+        ytd = {}
+        for pe_iso, (doc, is_annual) in docs.items():
+            v = self._report_value(doc, metric, is_annual)
+            if v is not None:
+                ytd[pe_iso] = v
+        if not ytd:
             return {}
-        rows = list(csv.reader(io.StringIO(blob["text"]), delimiter="\t"))
-        hdr = rows[0]
-        eid, ctxi, vali = hdr.index("要素ID"), hdr.index("コンテキストID"), hdr.index("値")
-        elt = self.metric_map[metric]
-        base_year = int(blob["pend"][:4])
-        base_q = quarter_of(int(blob["pend"][5:7]))
+        # group by fiscal year, index quarters, de-cumulate YTD -> discrete
+        from collections import defaultdict
+        groups = defaultdict(dict)
+        for pe_iso, v in ytd.items():
+            pe = datetime.date.fromisoformat(pe_iso)
+            fye = _month_last_day(pe.year + (pe.month > fye_month), fye_month)
+            mdist = (fye.year - pe.year) * 12 + (fye.month - pe.month)
+            qidx = 4 - mdist // 3            # 1..4 within the fiscal year
+            groups[fye][qidx] = (pe, v)
         out = {}
-        for r in rows[1:]:
-            if r[eid] != elt:
-                continue
-            ctx = r[ctxi]
-            if "NonConsolidated" in ctx:
-                continue
-            if ctx == "CurrentYearDuration":
-                k = 0
-            elif ctx.startswith("Prior") and ctx.endswith("YearDuration"):
-                try:
-                    k = int(ctx[len("Prior"):-len("YearDuration")])
-                except ValueError:
+        for q_map in groups.values():
+            for q in (1, 2, 3, 4):
+                if q not in q_map:
                     continue
-            else:
-                continue
-            try:
-                out[(base_year - k, base_q)] = float(r[vali])
-            except ValueError:
-                pass
+                pe, v = q_map[q]
+                if q == 1:
+                    disc = v
+                elif (q - 1) in q_map:
+                    disc = v - q_map[q - 1][1]
+                else:
+                    continue                 # missing prior quarter -> can't derive
+                out[cal_key_from_date(pe.isoformat())] = disc
         return out
 
 
@@ -546,8 +588,8 @@ class JapanSource(Source):
         if not self.ed.available:
             gaps.append("EDINET_KEY not set")
         self.note = ("; ".join(gaps) if gaps else
-                     "J-Quants covers recent ~2yr quarters; EDINET annual. "
-                     "Pre-2024 quarterly (EDINET 四半期報告書) not yet parsed.")
+                     "J-Quants covers recent ~2yr quarters (TDnet 決算短信); "
+                     "EDINET covers annual + pre-2024 quarterly securities reports.")
         self.metric_map = {**self.ed.metric_map, **self.jq.metric_map}
 
     def supports(self, metric):

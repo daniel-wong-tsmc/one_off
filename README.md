@@ -10,7 +10,7 @@ does not match**.
 | 🇺🇸 US | SEC EDGAR | none (User-Agent only) | quarterly, full history |
 | 🇰🇷 Korea | OpenDART | `DART_KEY` (free) | quarterly, full history |
 | 🇹🇼 Taiwan | FinMind | `FINMIND_TOKEN` optional | quarterly, full history |
-| 🇯🇵 Japan | J-Quants V2 + EDINET | `JQUANTS_KEY`, `EDINET_KEY` (free) | quarterly recent ~2yr (J-Quants); annual (EDINET); pre-2024 quarters pending |
+| 🇯🇵 Japan | J-Quants V2 + EDINET | `JQUANTS_KEY`, `EDINET_KEY` (free) | quarterly recent ~2yr (J-Quants) + pre-2024 quarterly & annual (EDINET 四半期/有価証券報告書) |
 
 ## Setup
 
@@ -83,14 +83,22 @@ Outputs:
 
 ## Known limitations (v1)
 
-- **Japan quarterly coverage is split across two sources.** J-Quants V2
-  (`/fins/summary`, TDnet 決算短信) supplies **discrete recent quarters** — its
-  free plan gives a rolling ~2 years plus a ~12-week delay, which covers exactly
-  the Q1/Q3 periods EDINET dropped after April 2024. EDINET supplies annual
-  securities-report data. The remaining gap is **pre-2024 quarterly history**
-  (older than the J-Quants free window): those rows return `MISSING_IN_API`
-  until EDINET 四半期報告書 parsing is added. Because the J-Quants free window
-  rolls forward, pull/cache older quarters sooner rather than later.
+- **Japan quarterly coverage is split across two sources**, merged
+  automatically (J-Quants wins on overlap):
+  - **J-Quants V2** (`/fins/summary`, TDnet 決算短信) — discrete recent quarters;
+    free plan is a rolling ~2 years + ~12-week delay, covering the Q1/Q3 periods
+    EDINET dropped after April 2024.
+  - **EDINET** — annual 有価証券報告書 **and** pre-2024 quarterly 四半期報告書.
+    Quarterly reports are discovered by scanning the statutory filing window
+    after each period end (slow on first run for a company, then cached), and
+    their year-to-date XBRL values are de-cumulated into discrete quarters.
+  - **EDINET quarterly covers revenue / operating income / net income only.**
+    EPS is intentionally excluded there: year-to-date EPS is restated across
+    stock splits (e.g. Socionext FY2024), so differencing it is invalid. Japan
+    EPS therefore comes from J-Quants (recent quarters) only.
+  - Any period neither source can reach (older than the J-Quants window *and*
+    with no EDINET filing) returns `MISSING_IN_API`. Because the J-Quants free
+    window rolls forward, cache older quarters sooner rather than later.
 - **Segment & geographic files are not auto-verified.** Business-segment and
   geographic splits live in filing *footnotes*, not clean numeric API fields
   (in Socionext's report, geographic revenue sits inside a text block, and it's
