@@ -453,6 +453,117 @@ class EdinetSource(Source):
         return out
 
 
+# ---- Japan: J-Quants V2 (recent quarters, from TDnet 決算短信) ------------- #
+class JQuantsSource(Source):
+    market = "jp"
+    BASE = "https://api.jquants.com/v2"
+    metric_map = {   # canonical -> /fins/summary field
+        "REVENUE": "Sales", "OPERATING_INCOME": "OP", "NET_INCOME": "NP",
+        "EPS_BASIC": "EPS", "TOTAL_ASSETS": "TA", "TOTAL_EQUITY": "Eq",
+    }
+
+    def __init__(self):
+        self.key = os.environ.get("JQUANTS_KEY")
+        self.available = bool(self.key)
+        self.note = "" if self.key else "JQUANTS_KEY not set"
+
+    def _summary(self, code):
+        ck = f"jquants_summary_{code}"
+        c = _cache_get(ck)
+        if c is not None:
+            return c
+        rows, params = [], {"code": code}
+        while True:
+            url = self.BASE + "/fins/summary?" + urllib.parse.urlencode(params)
+            d = _http_json(url, headers={"x-api-key": self.key})
+            if not d or "data" not in d:
+                break
+            rows.extend(d["data"])
+            if d.get("pagination_key"):
+                params["pagination_key"] = d["pagination_key"]
+            else:
+                break
+        _cache_put(ck, rows)
+        return rows
+
+    def quarterly(self, api_id, metric, fye_month=12, years=None):
+        if not self.available:
+            return {}
+        field = self.metric_map[metric]
+        kind = CANONICAL[metric]["kind"]
+        # actual financial statements only (skip forecast-only revisions);
+        # dedupe by (fiscal-year-end, period-type) keeping the latest disclosure
+        best = {}
+        for r in self._summary(api_id.strip()):
+            if "FinancialStatements" not in (r.get("DocType") or ""):
+                continue
+            k = (r.get("CurFYEn"), r.get("CurPerType"))
+            if k not in best or (r.get("DiscDate", "") > best[k].get("DiscDate", "")):
+                best[k] = r
+
+        def num(r):
+            try:
+                return float(r.get(field))
+            except (TypeError, ValueError):
+                return None
+
+        out = {}
+        if kind == "stock":
+            for r in best.values():
+                v, end = num(r), r.get("CurPerEn")
+                if v is not None and end:
+                    out[cal_key_from_date(end)] = v
+            return out
+        # flow: values are cumulative YTD -> de-cumulate within each fiscal year
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for r in best.values():
+            if r.get("CurPerEn") and num(r) is not None:
+                groups[r.get("CurFYEn")].append(r)
+        for grp in groups.values():
+            grp.sort(key=lambda r: r["CurPerEn"])
+            if len(grp) == 1 and grp[0].get("CurPerType") == "FY":
+                continue  # lone annual row -> can't derive a discrete quarter
+            prev = 0.0
+            for r in grp:
+                cum = num(r)
+                out[cal_key_from_date(r["CurPerEn"])] = cum - prev
+                prev = cum
+        return out
+
+
+# ---- Japan composite: J-Quants (recent) + EDINET (annual / future quarterly) #
+class JapanSource(Source):
+    market = "jp"
+
+    def __init__(self):
+        self.jq = JQuantsSource()
+        self.ed = EdinetSource()
+        self.available = self.jq.available or self.ed.available
+        gaps = []
+        if not self.jq.available:
+            gaps.append("JQUANTS_KEY not set")
+        if not self.ed.available:
+            gaps.append("EDINET_KEY not set")
+        self.note = ("; ".join(gaps) if gaps else
+                     "J-Quants covers recent ~2yr quarters; EDINET annual. "
+                     "Pre-2024 quarterly (EDINET 四半期報告書) not yet parsed.")
+        self.metric_map = {**self.ed.metric_map, **self.jq.metric_map}
+
+    def supports(self, metric):
+        return self.jq.supports(metric) or self.ed.supports(metric)
+
+    def quarterly(self, api_id, metric, fye_month=12, years=None):
+        out = {}
+        for src in (self.ed, self.jq):   # J-Quants wins on overlap (fresher)
+            if src.available and src.supports(metric):
+                try:
+                    out.update(src.quarterly(api_id, metric, fye_month, years))
+                except Exception:
+                    pass
+        return out
+
+
 # --------------------------------------------------------------------------- #
 # Registry & metric map (user-editable CSVs)
 # --------------------------------------------------------------------------- #
@@ -508,7 +619,7 @@ def compare(file_val, api_local, per_share):
 def run(data_dir: Path, out_dir: Path, compare_col: str,
         registry: dict, metric_map: dict, files_map: dict):
     sources = {s.market: s for s in
-               (EdgarSource(), OpenDartSource(), FinMindSource(), EdinetSource())}
+               (EdgarSource(), OpenDartSource(), FinMindSource(), JapanSource())}
     out_dir.mkdir(parents=True, exist_ok=True)
     results = []
 
