@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+"""
+verify_earnings.py
+==================
+Pull publicly-filed quarterly financials for companies across US / Korea /
+Taiwan / Japan and reconcile them against local CSV files, reporting which
+(company, metric, period) rows do NOT match.
+
+Sources (all free):
+  US      -> SEC EDGAR       (no key)
+  Korea   -> OpenDART        (env DART_KEY)
+  Taiwan  -> FinMind         (env FINMIND_TOKEN optional; works without for light use)
+  Japan   -> EDINET          (env EDINET_KEY)   [annual-only in v1, see README]
+
+Usage:
+  export DART_KEY=...  EDINET_KEY=...   # (FINMIND_TOKEN optional)
+  python verify_earnings.py --data-dir ./data --out-dir ./out
+  python verify_earnings.py --self-test        # live check against 4 known companies
+
+See README.md for the assumptions this makes about your files (units, which
+value column is compared, quarter semantics).
+"""
+from __future__ import annotations
+import argparse, csv, io, json, os, sys, time, zipfile, datetime, urllib.parse
+from pathlib import Path
+
+try:
+    import requests
+except ImportError:
+    sys.exit("This script needs 'requests'.  pip install -r requirements.txt")
+
+# --------------------------------------------------------------------------- #
+# Config
+# --------------------------------------------------------------------------- #
+ROOT = Path(__file__).resolve().parent
+CACHE = ROOT / "cache"
+CACHE.mkdir(exist_ok=True)
+SEC_UA = os.environ.get("SEC_USER_AGENT", "earnings-verify contact@example.com")
+REL_TOL = 0.01          # 1% relative tolerance for money metrics
+EPS_ABS_TOL = 0.02      # absolute tolerance for per-share values
+NEAR_ZERO = 1.0         # values (in millions) below this compared absolutely
+
+# Canonical metrics we know how to fetch.  kind: 'flow' (income statement,
+# summed over the quarter) or 'stock' (balance sheet, point-in-time).
+CANONICAL = {
+    "REVENUE":          {"kind": "flow",  "per_share": False},
+    "OPERATING_INCOME": {"kind": "flow",  "per_share": False},
+    "NET_INCOME":       {"kind": "flow",  "per_share": False},
+    "EPS_BASIC":        {"kind": "flow",  "per_share": True},
+    "ACCOUNTS_PAYABLE": {"kind": "stock", "per_share": False},
+    "TOTAL_ASSETS":     {"kind": "stock", "per_share": False},
+    "TOTAL_EQUITY":     {"kind": "stock", "per_share": False},
+}
+
+SESSION = requests.Session()
+
+
+def _cache_get(key: str):
+    f = CACHE / (key.replace("/", "_") + ".json")
+    if f.exists():
+        return json.loads(f.read_text())
+    return None
+
+
+def _cache_put(key: str, val):
+    (CACHE / (key.replace("/", "_") + ".json")).write_text(json.dumps(val))
+
+
+def _http_json(url: str, headers=None, cache_key=None, retries=3):
+    if cache_key:
+        c = _cache_get(cache_key)
+        if c is not None:
+            return c
+    for i in range(retries):
+        try:
+            r = SESSION.get(url, headers=headers or {}, timeout=60)
+            if r.status_code == 404:
+                if cache_key:
+                    _cache_put(cache_key, None)
+                return None
+            r.raise_for_status()
+            data = r.json()
+            if cache_key:
+                _cache_put(cache_key, data)
+            return data
+        except Exception:
+            if i == retries - 1:
+                raise
+            time.sleep(2 * (i + 1))
+
+
+def quarter_of(month: int) -> int:
+    return (month - 1) // 3 + 1
+
+
+def cal_key_from_date(d: str):
+    """'2024-03-31' -> (2024, 1)"""
+    dt = datetime.date.fromisoformat(d[:10])
+    return (dt.year, quarter_of(dt.month))
+
+
+# --------------------------------------------------------------------------- #
+# Sources
+# --------------------------------------------------------------------------- #
+class Source:
+    market = "?"
+    available = True
+    note = ""
+
+    def supports(self, metric: str) -> bool:
+        return metric in self.metric_map
+
+    def quarterly(self, api_id: str, metric: str, fye_month: int = 12,
+                  years=None) -> dict:
+        """Return {(cal_year, cal_q): value_in_local_currency}. Discrete for
+        flow metrics, period-end balance for stock metrics. `years` is the set
+        of calendar years actually needed (lets per-year sources fetch less)."""
+        raise NotImplementedError
+
+
+# ---- US: SEC EDGAR -------------------------------------------------------- #
+class EdgarSource(Source):
+    market = "us"
+    metric_map = {
+        "REVENUE": ["RevenueFromContractWithCustomerExcludingAssessedTax",
+                    "Revenues", "RevenueFromContractWithCustomerIncludingAssessedTax",
+                    "SalesRevenueNet"],
+        "OPERATING_INCOME": ["OperatingIncomeLoss"],
+        "NET_INCOME": ["NetIncomeLoss"],
+        "EPS_BASIC": ["EarningsPerShareBasic"],
+        "ACCOUNTS_PAYABLE": ["AccountsPayableCurrent", "AccountsPayableTradeCurrent"],
+        "TOTAL_ASSETS": ["Assets"],
+        "TOTAL_EQUITY": ["StockholdersEquity"],
+    }
+
+    def __init__(self):
+        self._cik = {}
+
+    def _resolve_cik(self, api_id: str) -> str | None:
+        api_id = api_id.strip().upper()
+        if api_id.isdigit():
+            return api_id.zfill(10)
+        if not self._cik:
+            d = _http_json("https://www.sec.gov/files/company_tickers.json",
+                           headers={"User-Agent": SEC_UA}, cache_key="edgar_tickers")
+            for v in (d or {}).values():
+                self._cik[v["ticker"].upper()] = str(v["cik_str"]).zfill(10)
+        return self._cik.get(api_id)
+
+    def _concept(self, cik: str, tag: str):
+        return _http_json(
+            f"https://data.sec.gov/api/xbrl/companyconcept/CIK{cik}/us-gaap/{tag}.json",
+            headers={"User-Agent": SEC_UA}, cache_key=f"edgar_{cik}_{tag}")
+
+    def quarterly(self, api_id, metric, fye_month=12, years=None):
+        cik = self._resolve_cik(api_id)
+        if not cik:
+            return {}
+        per_share = CANONICAL[metric]["per_share"]
+        kind = CANONICAL[metric]["kind"]
+        unit = "USD/shares" if per_share else "USD"
+        # use the first fallback tag that actually has data (don't mix tags,
+        # e.g. Excluding- vs Including-AssessedTax revenue)
+        facts = []
+        for tag in self.metric_map[metric]:
+            d = self._concept(cik, tag)
+            if d and d.get("units", {}).get(unit):
+                facts = d["units"][unit]
+                break
+        if not facts:
+            return {}
+        if kind == "stock":
+            out = {}
+            for x in facts:
+                if x.get("end") and not x.get("start"):
+                    out[cal_key_from_date(x["end"])] = float(x["val"])
+                elif x.get("end") and x.get("start"):
+                    s = datetime.date.fromisoformat(x["start"])
+                    e = datetime.date.fromisoformat(x["end"])
+                    if (e - s).days <= 5:   # instant reported as tiny duration
+                        out[cal_key_from_date(x["end"])] = float(x["val"])
+            return out
+        # flow: collect discrete quarters (~90d) and annuals (~365d)
+        quarters, annuals = {}, {}
+        for x in facts:
+            if not (x.get("start") and x.get("end") and x.get("form")):
+                continue
+            s = datetime.date.fromisoformat(x["start"])
+            e = datetime.date.fromisoformat(x["end"])
+            days = (e - s).days
+            if 80 <= days <= 100:
+                quarters[cal_key_from_date(x["end"])] = (float(x["val"]), e)
+            elif 350 <= days <= 380:
+                annuals[e] = float(x["val"])
+        out = {k: v[0] for k, v in quarters.items()}
+        # derive Q4 = FY - (the three quarters ending within the prior ~12 months)
+        for e_annual, ann_val in annuals.items():
+            sub = [v for (k, (v, e)) in quarters.items()
+                   if 0 < (e_annual - e).days <= 285]
+            if len(sub) == 3:
+                out[cal_key_from_date(e_annual.isoformat())] = ann_val - sum(sub)
+        return out
+
+
+# ---- Korea: OpenDART ------------------------------------------------------ #
+class OpenDartSource(Source):
+    market = "kr"
+    metric_map = {
+        "REVENUE": (["매출액", "수익(매출액)", "영업수익", "매출"], ("IS", "CIS")),
+        "OPERATING_INCOME": (["영업이익", "영업이익(손실)"], ("IS", "CIS")),
+        "NET_INCOME": (["당기순이익", "당기순이익(손실)", "분기순이익", "반기순이익"], ("IS", "CIS")),
+        "EPS_BASIC": (["기본주당이익", "기본주당이익(손실)", "기본주당순이익"], ("IS", "CIS")),
+        "ACCOUNTS_PAYABLE": (["매입채무", "매입채무및기타채무"], ("BS",)),
+        "TOTAL_ASSETS": (["자산총계"], ("BS",)),
+        "TOTAL_EQUITY": (["자본총계"], ("BS",)),
+    }
+    REPRT = {1: "11013", 2: "11012", 3: "11014", 4: "11011"}
+
+    def __init__(self):
+        self.key = os.environ.get("DART_KEY")
+        self.available = bool(self.key)
+        self.note = "" if self.key else "DART_KEY not set"
+        self._corp = None
+
+    def _corp_map(self):
+        if self._corp is None:
+            self._corp = {}
+            zf = CACHE / "dart_corp.zip"
+            if not zf.exists():
+                r = SESSION.get(
+                    f"https://opendart.fss.or.kr/api/corpCode.xml?crtfc_key={self.key}",
+                    timeout=300)
+                zf.write_bytes(r.content)
+            import xml.etree.ElementTree as ET
+            data = zipfile.ZipFile(zf).read("CORPCODE.xml").decode("utf-8")
+            for el in ET.fromstring(data).iter("list"):
+                sc = (el.findtext("stock_code") or "").strip()
+                if sc:
+                    self._corp[sc] = el.findtext("corp_code")
+        return self._corp
+
+    def _fs(self, corp, year, reprt, fs_div):
+        q = urllib.parse.urlencode({"crtfc_key": self.key, "corp_code": corp,
+                                    "bsns_year": str(year), "reprt_code": reprt,
+                                    "fs_div": fs_div})
+        return _http_json("https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json?" + q,
+                          cache_key=f"dart_{corp}_{year}_{reprt}_{fs_div}")
+
+    def _val(self, data, names, sj_divs):
+        if not data or data.get("status") != "000":
+            return None
+        for row in data.get("list", []):
+            if (row.get("account_nm") or "").strip() in names and row.get("sj_div") in sj_divs:
+                raw = (row.get("thstrm_amount") or "").replace(",", "").strip()
+                try:
+                    return float(raw)
+                except ValueError:
+                    return None
+        return None
+
+    def quarterly(self, api_id, metric, fye_month=12, years=None):
+        if not self.available:
+            return {}
+        corp = self._corp_map().get(api_id.strip())
+        if not corp:
+            return {}
+        names, sj = self.metric_map[metric]
+        kind = CANONICAL[metric]["kind"]
+        if years:
+            year_range = sorted(set(int(y) for y in years))
+        else:
+            year_range = range(2015, datetime.date.today().year + 1)
+        out = {}
+        for year in year_range:
+            vals = {}
+            for q, reprt in self.REPRT.items():
+                # consolidated preferred; fall back to separate if no value
+                v = self._val(self._fs(corp, year, reprt, "CFS"), names, sj)
+                if v is None:
+                    v = self._val(self._fs(corp, year, reprt, "OFS"), names, sj)
+                if v is not None:
+                    vals[q] = v
+            if not vals:
+                continue
+            if kind == "stock":
+                for q, v in vals.items():
+                    out[(year, q)] = v
+            else:
+                for q, v in self._to_discrete(vals).items():
+                    out[(year, q)] = v
+        return out
+
+    @staticmethod
+    def _to_discrete(vals: dict) -> dict:
+        """vals keyed by report quarter 1..4. Interim thstrm may be discrete
+        (3-month) or cumulative depending on the filer; detect via the ratio of
+        the Q3 report to the annual, then produce discrete quarters."""
+        out = {}
+        fy = vals.get(4)
+        q3r = vals.get(3)
+        cumulative = False
+        if fy and q3r and fy != 0:
+            cumulative = (q3r / fy) > 0.5   # ~0.75 => cumulative 9M; ~0.25 => discrete
+        if cumulative:
+            prev = 0
+            for q in (1, 2, 3):
+                if q in vals:
+                    out[q] = vals[q] - prev
+                    prev = vals[q]
+            if fy is not None and 3 in vals:
+                out[4] = fy - vals[3]
+        else:
+            for q in (1, 2, 3):
+                if q in vals:
+                    out[q] = vals[q]
+            if fy is not None:
+                out[4] = fy - sum(vals.get(q, 0) for q in (1, 2, 3))
+        return out
+
+
+# ---- Taiwan: FinMind ------------------------------------------------------ #
+class FinMindSource(Source):
+    market = "tw"
+    IS = "TaiwanStockFinancialStatements"
+    BS = "TaiwanStockBalanceSheet"
+    metric_map = {
+        "REVENUE": (IS, "Revenue"),
+        "OPERATING_INCOME": (IS, "OperatingIncome"),
+        "NET_INCOME": (IS, "IncomeAfterTaxes"),
+        "EPS_BASIC": (IS, "EPS"),
+        "ACCOUNTS_PAYABLE": (BS, "AccountsPayable"),
+        "TOTAL_ASSETS": (BS, "TotalAssets"),
+        "TOTAL_EQUITY": (BS, "TotalEquity"),
+    }
+
+    def __init__(self):
+        self.token = os.environ.get("FINMIND_TOKEN", "")
+
+    def _data(self, dataset, sid):
+        q = {"dataset": dataset, "data_id": sid,
+             "start_date": "2015-01-01",
+             "end_date": datetime.date.today().isoformat()}
+        if self.token:
+            q["token"] = self.token
+        url = "https://api.finmindtrade.com/api/v4/data?" + urllib.parse.urlencode(q)
+        return _http_json(url, cache_key=f"finmind_{dataset}_{sid}")
+
+    def quarterly(self, api_id, metric, fye_month=12, years=None):
+        dataset, typ = self.metric_map[metric]
+        d = self._data(dataset, api_id.strip())
+        if not d or d.get("status") != 200:
+            return {}
+        out = {}
+        for row in d.get("data", []):
+            if row.get("type") == typ:
+                out[cal_key_from_date(row["date"])] = float(row["value"])
+        return out
+
+
+# ---- Japan: EDINET (annual-only in v1) ------------------------------------ #
+class EdinetSource(Source):
+    market = "jp"
+    metric_map = {   # element-id -> annual value; quarterly not covered in v1
+        "REVENUE": "jpcrp_cor:NetSalesSummaryOfBusinessResults",
+        "NET_INCOME": "jpcrp_cor:ProfitLossAttributableToOwnersOfParentSummaryOfBusinessResults",
+        "EPS_BASIC": "jpcrp_cor:BasicEarningsLossPerShareSummaryOfBusinessResults",
+        "OPERATING_INCOME": "jppfs_cor:OperatingIncome",
+    }
+    note = "EDINET provides annual securities-report data only in v1; " \
+           "quarterly reports were abolished for FYs starting Apr-2024. " \
+           "Quarterly JP rows report MISSING_IN_API."
+
+    def __init__(self):
+        self.key = os.environ.get("EDINET_KEY")
+        self.available = bool(self.key)
+        if not self.key:
+            self.note = "EDINET_KEY not set"
+
+    def _find_annual_doc(self, sec5: str):
+        """Scan recent June windows to find the latest annual securities report
+        (docTypeCode 120) for a 5-digit secCode."""
+        today = datetime.date.today()
+        for year in range(today.year, today.year - 4, -1):
+            for day in range(15, 31):
+                date = f"{year}-06-{day:02d}"
+                if datetime.date.fromisoformat(date) > today:
+                    continue
+                lst = _http_json(
+                    f"https://api.edinet-fsa.go.jp/api/v2/documents.json?date={date}"
+                    f"&type=2&Subscription-Key={self.key}",
+                    cache_key=f"edinet_list_{date}")
+                for r in (lst or {}).get("results", []):
+                    if r.get("secCode") == sec5 and r.get("docTypeCode") == "120":
+                        return r.get("docID"), r.get("periodEnd")
+        return None, None
+
+    def _annual_series(self, sec5):
+        doc, pend = self._find_annual_doc(sec5)
+        if not doc:
+            return {}
+        key = f"edinet_csv_{doc}"
+        cached = _cache_get(key)
+        if cached is None:
+            r = SESSION.get(
+                f"https://api.edinet-fsa.go.jp/api/v2/documents/{doc}"
+                f"?type=5&Subscription-Key={self.key}", timeout=120)
+            zf = zipfile.ZipFile(io.BytesIO(r.content))
+            name = [n for n in zf.namelist() if "asr" in n][0]
+            text = zf.read(name).decode("utf-16")
+            cached = {"text": text, "pend": pend}
+            _cache_put(key, cached)
+        return cached
+
+    def quarterly(self, api_id, metric, fye_month=12, years=None):
+        # v1: no reliable quarterly source -> signal MISSING for quarterly rows
+        return {}
+
+    def annual(self, api_id, metric):
+        if not self.available:
+            return {}
+        sec5 = api_id.strip()
+        if len(sec5) == 4:
+            sec5 += "0"
+        blob = self._annual_series(sec5)
+        if not blob:
+            return {}
+        rows = list(csv.reader(io.StringIO(blob["text"]), delimiter="\t"))
+        hdr = rows[0]
+        eid, ctxi, vali = hdr.index("要素ID"), hdr.index("コンテキストID"), hdr.index("値")
+        elt = self.metric_map[metric]
+        base_year = int(blob["pend"][:4])
+        base_q = quarter_of(int(blob["pend"][5:7]))
+        out = {}
+        for r in rows[1:]:
+            if r[eid] != elt:
+                continue
+            ctx = r[ctxi]
+            if "NonConsolidated" in ctx:
+                continue
+            if ctx == "CurrentYearDuration":
+                k = 0
+            elif ctx.startswith("Prior") and ctx.endswith("YearDuration"):
+                try:
+                    k = int(ctx[len("Prior"):-len("YearDuration")])
+                except ValueError:
+                    continue
+            else:
+                continue
+            try:
+                out[(base_year - k, base_q)] = float(r[vali])
+            except ValueError:
+                pass
+        return out
+
+
+# --------------------------------------------------------------------------- #
+# Registry & metric map (user-editable CSVs)
+# --------------------------------------------------------------------------- #
+def load_registry(path: Path) -> dict:
+    reg = {}
+    if not path.exists():
+        return reg
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            if not row.get("company_id") or row["company_id"].startswith("#"):
+                continue
+            reg[row["company_id"].strip()] = {
+                "market": row["market"].strip().lower(),
+                "api_id": row["api_id"].strip(),
+                "fye_month": int(row.get("fye_month") or 12),
+                "name": (row.get("name") or "").strip(),
+            }
+    return reg
+
+
+def load_metric_map(path: Path) -> dict:
+    mm = {}
+    if not path.exists():
+        return mm
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            code = (row.get("financial_code") or "").strip()
+            if not code or code.startswith("#"):
+                continue
+            mm[code] = (row.get("canonical_metric") or "").strip()
+    return mm
+
+
+# --------------------------------------------------------------------------- #
+# Verifier
+# --------------------------------------------------------------------------- #
+SEG_FILES = {"Seg_Seg_Revenue", "Seg_Seg_Operating_Income",
+             "Seg_Geo_Revenue", "Seg_Geo_Operating_Income"}
+
+
+def compare(file_val, api_local, per_share):
+    if per_share:
+        return ("MATCH" if abs(file_val - api_local) <= EPS_ABS_TOL else "MISMATCH",
+                api_local)
+    api_m = api_local / 1e6           # source is full local currency -> millions
+    if max(abs(file_val), abs(api_m)) < NEAR_ZERO:
+        ok = abs(file_val - api_m) < NEAR_ZERO
+    else:
+        ok = abs(file_val - api_m) / max(abs(file_val), abs(api_m)) <= REL_TOL
+    return ("MATCH" if ok else "MISMATCH", api_m)
+
+
+def run(data_dir: Path, out_dir: Path, compare_col: str,
+        registry: dict, metric_map: dict, files_map: dict):
+    sources = {s.market: s for s in
+               (EdgarSource(), OpenDartSource(), FinMindSource(), EdinetSource())}
+    out_dir.mkdir(parents=True, exist_ok=True)
+    results = []
+
+    # pre-scan: which calendar years does each company appear in? (lets per-year
+    # sources like OpenDART fetch only what's needed instead of all history)
+    years_by_company = {}
+    for logical, fname in files_map.items():
+        fpath = data_dir / fname
+        if not fpath.exists():
+            continue
+        with open(fpath, encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f, delimiter=";"):
+                cid = (row.get("company_id") or "").strip()
+                cy = (row.get("calendar_year") or "").strip()
+                if cid and cy.isdigit():
+                    years_by_company.setdefault(cid, set()).add(int(cy))
+
+    series_cache = {}   # (market, api_id, metric) -> {(y,q): value}
+
+    def get_series(src, comp, cid, metric):
+        k = (comp["market"], comp["api_id"], metric)
+        if k not in series_cache:
+            series_cache[k] = src.quarterly(
+                comp["api_id"], metric, comp["fye_month"],
+                years=years_by_company.get(cid))
+        return series_cache[k]
+
+    for logical, fname in files_map.items():
+        fpath = data_dir / fname
+        if not fpath.exists():
+            print(f"  (skip {logical}: {fpath} not found)")
+            continue
+        is_seg = logical in SEG_FILES
+        with open(fpath, encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f, delimiter=";"):
+                cid = (row.get("company_id") or "").strip()
+                cy = (row.get("calendar_year") or "").strip()
+                cq = (row.get("calendar_quarter") or "").strip()
+                code = (row.get("financial_code") or "").strip()
+                rec = {"file": logical, "company_id": cid,
+                       "calendar_year": cy, "calendar_quarter": cq,
+                       "financial_code": code,
+                       "segment_code": (row.get("segment_code") or "").strip(),
+                       "file_value": row.get(compare_col, ""),
+                       "api_value_local": "", "api_value_millions": "",
+                       "status": "", "note": ""}
+                comp = registry.get(cid)
+                cname = comp["name"] if comp else ""
+                rec["company_name"] = cname
+
+                if is_seg:
+                    rec["status"] = "UNSUPPORTED_SEGMENT"
+                    rec["note"] = "segment/geo not auto-verified in v1 (see README)"
+                    results.append(rec); continue
+                if not comp:
+                    rec["status"] = "COMPANY_NOT_CONFIGURED"
+                    rec["note"] = "add to config/company_registry.csv"
+                    results.append(rec); continue
+                canonical = metric_map.get(code)
+                if not canonical:
+                    rec["status"] = "NO_MAPPING"
+                    rec["note"] = "add to config/metric_map.csv"
+                    results.append(rec); continue
+                src = sources.get(comp["market"])
+                if not src or not src.available:
+                    rec["status"] = "SOURCE_UNAVAILABLE"
+                    rec["note"] = src.note if src else f"market {comp['market']}"
+                    results.append(rec); continue
+                if not src.supports(canonical):
+                    rec["status"] = "UNSUPPORTED_METRIC"
+                    rec["note"] = f"{comp['market']} source lacks {canonical}"
+                    results.append(rec); continue
+                try:
+                    fv = float(str(rec["file_value"]).replace(",", ""))
+                except ValueError:
+                    rec["status"] = "BAD_FILE_VALUE"; results.append(rec); continue
+
+                try:
+                    key = (int(cy), int(cq))
+                    series = get_series(src, comp, cid, canonical)
+                    api_local = series.get(key)
+                    if api_local is None and comp["market"] == "jp":
+                        rec["note"] = sources["jp"].note
+                    if api_local is None:
+                        rec["status"] = "MISSING_IN_API"
+                        results.append(rec); continue
+                    status, api_m = compare(fv, api_local,
+                                            CANONICAL[canonical]["per_share"])
+                    rec["api_value_local"] = api_local
+                    rec["api_value_millions"] = "" if CANONICAL[canonical]["per_share"] else round(api_m, 3)
+                    rec["status"] = status
+                except Exception as e:
+                    rec["status"] = "ERROR"; rec["note"] = str(e)[:120]
+                results.append(rec)
+
+    # write outputs
+    cols = ["file", "company_id", "company_name", "calendar_year", "calendar_quarter",
+            "financial_code", "segment_code", "file_value", "api_value_local",
+            "api_value_millions", "status", "note"]
+    all_csv = out_dir / "verification_results.csv"
+    with open(all_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols); w.writeheader()
+        for r in results:
+            w.writerow({k: r.get(k, "") for k in cols})
+    mism = [r for r in results if r["status"] == "MISMATCH"]
+    mm_csv = out_dir / "mismatches.csv"
+    with open(mm_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols); w.writeheader()
+        for r in mism:
+            w.writerow({k: r.get(k, "") for k in cols})
+
+    # console summary
+    from collections import Counter
+    counts = Counter(r["status"] for r in results)
+    print("\n=== Summary ===")
+    for st, n in sorted(counts.items(), key=lambda x: -x[1]):
+        print(f"  {st:22} {n}")
+    print(f"\nFull results : {all_csv}")
+    print(f"Mismatches   : {mm_csv}  ({len(mism)} rows)")
+    if mism:
+        print("\n=== MISMATCHES (company / metric / period) ===")
+        for r in mism:
+            print(f"  [{r['company_id']} {r['company_name']}] {r['financial_code']} "
+                  f"{r['calendar_year']}Q{r['calendar_quarter']}: "
+                  f"file={r['file_value']} vs api(millions)={r['api_value_millions']}")
+    return results
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+DEFAULT_FILES = {
+    "FA": "FA.csv",
+    "Seg_Seg_Revenue": "Seg_Seg_Revenue.csv",
+    "Seg_Seg_Operating_Income": "Seg_Seg_Operating_Income.csv",
+    "Seg_Geo_Revenue": "Seg_Geo_Revenue.csv",
+    "Seg_Geo_Operating_Income": "Seg_Geo_Operating_Income.csv",
+}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--data-dir", default="data", help="dir with your CSV files")
+    ap.add_argument("--out-dir", default="out")
+    ap.add_argument("--config-dir", default="config")
+    ap.add_argument("--compare-column", default="financial_report_value",
+                    choices=["financial_report_value", "financial_value"],
+                    help="which file column to reconcile against the API")
+    ap.add_argument("--self-test", action="store_true",
+                    help="run live against the 4 validated companies in sample_data/")
+    args = ap.parse_args()
+
+    cfg = Path(args.config_dir)
+    if args.self_test:
+        args.data_dir = "sample_data"
+        cfg = Path("sample_data")
+    registry = load_registry(cfg / "company_registry.csv")
+    metric_map = load_metric_map(Path(args.config_dir) / "metric_map.csv")
+    if not registry:
+        print("WARNING: empty company_registry.csv — every row will be COMPANY_NOT_CONFIGURED")
+    run(Path(args.data_dir), Path(args.out_dir), args.compare_column,
+        registry, metric_map, DEFAULT_FILES)
+
+
+if __name__ == "__main__":
+    main()

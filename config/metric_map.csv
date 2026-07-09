@@ -1,0 +1,18 @@
+financial_code,canonical_metric
+# Maps the financial_code values in your FA.csv to a canonical metric the
+# script knows how to fetch from each market's API. Add rows as you discover
+# more codes in your data. Unmapped codes are reported as NO_MAPPING (not a
+# mismatch) so nothing is silently skipped.
+REVENUE,REVENUE
+NET_REVENUE,REVENUE
+TOTAL_REVENUE,REVENUE
+OPERATING_INCOME,OPERATING_INCOME
+OPERATING_PROFIT,OPERATING_INCOME
+NET_INCOME,NET_INCOME
+NET_PROFIT,NET_INCOME
+EPS,EPS_BASIC
+EPS_BASIC,EPS_BASIC
+BASIC_EPS,EPS_BASIC
+ACCOUNTS_PAYABLE,ACCOUNTS_PAYABLE
+TOTAL_ASSETS,TOTAL_ASSETS
+TOTAL_EQUITY,TOTAL_EQUITY
