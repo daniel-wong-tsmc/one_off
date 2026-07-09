@@ -44,14 +44,46 @@ NEAR_ZERO = 1.0         # values (in millions) below this compared absolutely
 # Canonical metrics we know how to fetch.  kind: 'flow' (income statement,
 # summed over the quarter) or 'stock' (balance sheet, point-in-time).
 CANONICAL = {
-    "REVENUE":          {"kind": "flow",  "per_share": False},
-    "OPERATING_INCOME": {"kind": "flow",  "per_share": False},
-    "NET_INCOME":       {"kind": "flow",  "per_share": False},
-    "EPS_BASIC":        {"kind": "flow",  "per_share": True},
-    "ACCOUNTS_PAYABLE": {"kind": "stock", "per_share": False},
-    "TOTAL_ASSETS":     {"kind": "stock", "per_share": False},
-    "TOTAL_EQUITY":     {"kind": "stock", "per_share": False},
+    "REVENUE":             {"kind": "flow",  "per_share": False},
+    "COGS":                {"kind": "flow",  "per_share": False},
+    "GROSS_PROFIT":        {"kind": "flow",  "per_share": False},
+    "OPERATING_INCOME":    {"kind": "flow",  "per_share": False},
+    "PRE_TAX_INCOME":      {"kind": "flow",  "per_share": False},
+    "NET_INCOME":          {"kind": "flow",  "per_share": False},
+    "EPS_BASIC":           {"kind": "flow",  "per_share": True},
+    "EPS_DILUTED":         {"kind": "flow",  "per_share": True},
+    "ACCOUNTS_PAYABLE":    {"kind": "stock", "per_share": False},
+    "CURRENT_ASSETS":      {"kind": "stock", "per_share": False},
+    "TOTAL_ASSETS":        {"kind": "stock", "per_share": False},
+    "CURRENT_LIABILITIES": {"kind": "stock", "per_share": False},
+    "TOTAL_LIABILITIES":   {"kind": "stock", "per_share": False},
+    "TOTAL_EQUITY":        {"kind": "stock", "per_share": False},
 }
+
+# Derived / ratio metrics (margins, turnover days, cash-conversion cycle,
+# QoQ/YoY deltas). These are NOT a single as-filed line item — they are computed
+# from primitives with company-specific conventions (which denominator, discrete
+# vs trailing-twelve-month, period-average vs point-in-time), so pulling one API
+# field can't reproduce them and dividing by 1e6 would be nonsense. We flag them
+# UNSUPPORTED_DERIVED rather than guess. Map a code to `DERIVED` in metric_map.csv,
+# or use a *_QOQ / *_YOY suffix, to land here.
+DERIVED_SENTINEL = "DERIVED"
+DERIVED_METRICS = {
+    "NET_MARGIN", "GROSS_MARGIN", "OPERATING_MARGIN", "EBITDA_MARGIN",
+    "CASH_CONVERSION_CYCLE", "DAYS_OF_INVENTORY", "DAYS_INVENTORY_OUTSTANDING",
+    "DAYS_SALES_OUTSTANDING", "DAYS_PAYABLE_OUTSTANDING",
+    "INVENTORY_TURNOVER", "ASSET_TURNOVER", "CURRENT_RATIO", "QUICK_RATIO",
+    "ROE", "ROA", "DEBT_TO_EQUITY",
+}
+
+
+def is_derived_code(code: str, canonical: str) -> bool:
+    """True if this financial_code is a derived ratio/turnover/delta metric that
+    can't be reconciled against a single as-filed API line item."""
+    if canonical == DERIVED_SENTINEL:
+        return True
+    c = code.upper()
+    return c in DERIVED_METRICS or c.endswith("_QOQ") or c.endswith("_YOY")
 
 SESSION = requests.Session()
 
@@ -95,9 +127,23 @@ def quarter_of(month: int) -> int:
 
 
 def cal_key_from_date(d: str):
-    """'2024-03-31' -> (2024, 1)"""
+    """Map a fiscal period-end date to the calendar quarter the period belongs
+    to, by snapping to the NEAREST calendar quarter-end.
+
+    52/53-week filers (e.g. Qorvo) routinely end a quarter a few days into the
+    following month — 2023-04-01 is the Jan–Mar (Q1) quarter, 2020-10-03 is the
+    Jul–Sep (Q3) quarter — so keying off the raw period-end month bucketed them
+    into the *next* calendar quarter. The user's `calendar_quarter` reflects the
+    quarter the period actually falls in, which is what nearest-quarter-end
+    snapping reproduces. Ordinary calendar/month-end filers are unaffected.
+      '2024-03-31' -> (2024, 1);  '2023-04-01' -> (2023, 1);  '2020-10-03' -> (2020, 3)
+    """
     dt = datetime.date.fromisoformat(d[:10])
-    return (dt.year, quarter_of(dt.month))
+    cands = [datetime.date(yy, mm, dd)
+             for yy in (dt.year - 1, dt.year, dt.year + 1)
+             for mm, dd in ((3, 31), (6, 30), (9, 30), (12, 31))]
+    best = min(cands, key=lambda c: abs((c - dt).days))
+    return (best.year, quarter_of(best.month))
 
 
 # --------------------------------------------------------------------------- #
@@ -126,11 +172,21 @@ class EdgarSource(Source):
         "REVENUE": ["RevenueFromContractWithCustomerExcludingAssessedTax",
                     "Revenues", "RevenueFromContractWithCustomerIncludingAssessedTax",
                     "SalesRevenueNet"],
+        "COGS": ["CostOfGoodsAndServicesSold", "CostOfRevenue", "CostOfGoodsSold",
+                 "CostOfGoodsAndServicesSoldExcludingDepreciationDepletionAndAmortization"],
+        "GROSS_PROFIT": ["GrossProfit"],
         "OPERATING_INCOME": ["OperatingIncomeLoss"],
+        "PRE_TAX_INCOME": [
+            "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+            "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"],
         "NET_INCOME": ["NetIncomeLoss"],
         "EPS_BASIC": ["EarningsPerShareBasic"],
+        "EPS_DILUTED": ["EarningsPerShareDiluted"],
         "ACCOUNTS_PAYABLE": ["AccountsPayableCurrent", "AccountsPayableTradeCurrent"],
+        "CURRENT_ASSETS": ["AssetsCurrent"],
         "TOTAL_ASSETS": ["Assets"],
+        "CURRENT_LIABILITIES": ["LiabilitiesCurrent"],
+        "TOTAL_LIABILITIES": ["Liabilities"],
         "TOTAL_EQUITY": ["StockholdersEquity"],
     }
 
@@ -200,6 +256,40 @@ class EdgarSource(Source):
                    if 0 < (e_annual - e).days <= 285]
             if len(sub) == 3:
                 out[cal_key_from_date(e_annual.isoformat())] = ann_val - sum(sub)
+        # YTD-ladder fallback: many filers report an income item only as
+        # year-to-date cumulatives in their 10-Qs (Q1 ~90d, then ~180/270/365d,
+        # all sharing one fiscal-year start) instead of discrete quarters. Group
+        # duration facts by start date and de-cumulate each contiguous ladder,
+        # filling ONLY quarters the discrete path above didn't already produce
+        # (setdefault). A rung is emitted only when the immediately preceding
+        # quarter of the ladder is present, so every value written is exactly a
+        # one-quarter difference (never annual-minus-Q1, etc.).
+        from collections import defaultdict
+        by_start = defaultdict(list)
+        for x in facts:
+            if not (x.get("start") and x.get("end")):
+                continue
+            s = datetime.date.fromisoformat(x["start"])
+            e = datetime.date.fromisoformat(x["end"])
+            dd = (e - s).days
+            if dd >= 80:
+                by_start[s].append((e, dd, float(x["val"])))
+        for _s, lst in by_start.items():
+            ladder = {}
+            for e, dd, v in lst:
+                qi = round(dd / 91.3)
+                if 1 <= qi <= 4:
+                    prev = ladder.get(qi)
+                    if prev is None or abs(dd - qi * 91.3) < abs(prev[1] - qi * 91.3):
+                        ladder[qi] = (e, dd, v)
+            if len(ladder) < 2:
+                continue
+            prev_v, prev_q = 0.0, 0
+            for qi in sorted(ladder):
+                e, dd, v = ladder[qi]
+                if qi - 1 == prev_q:
+                    out.setdefault(cal_key_from_date(e.isoformat()), v - prev_v)
+                prev_v, prev_q = v, qi
         return out
 
 
@@ -339,11 +429,20 @@ class OpenDartSource(Source):
     market = "kr"
     metric_map = {
         "REVENUE": (["매출액", "수익(매출액)", "영업수익", "매출"], ("IS", "CIS")),
+        "COGS": (["매출원가"], ("IS", "CIS")),
+        "GROSS_PROFIT": (["매출총이익", "매출총이익(손실)"], ("IS", "CIS")),
         "OPERATING_INCOME": (["영업이익", "영업이익(손실)"], ("IS", "CIS")),
+        "PRE_TAX_INCOME": (["법인세비용차감전순이익", "법인세비용차감전계속사업이익",
+                            "법인세차감전순이익", "법인세비용차감전순이익(손실)",
+                            "법인세비용차감전계속영업이익"], ("IS", "CIS")),
         "NET_INCOME": (["당기순이익", "당기순이익(손실)", "분기순이익", "반기순이익"], ("IS", "CIS")),
         "EPS_BASIC": (["기본주당이익", "기본주당이익(손실)", "기본주당순이익"], ("IS", "CIS")),
+        "EPS_DILUTED": (["희석주당이익", "희석주당이익(손실)", "희석주당순이익"], ("IS", "CIS")),
         "ACCOUNTS_PAYABLE": (["매입채무", "매입채무및기타채무"], ("BS",)),
+        "CURRENT_ASSETS": (["유동자산"], ("BS",)),
         "TOTAL_ASSETS": (["자산총계"], ("BS",)),
+        "CURRENT_LIABILITIES": (["유동부채"], ("BS",)),
+        "TOTAL_LIABILITIES": (["부채총계"], ("BS",)),
         "TOTAL_EQUITY": (["자본총계"], ("BS",)),
     }
     REPRT = {1: "11013", 2: "11012", 3: "11014", 4: "11011"}
@@ -457,11 +556,17 @@ class FinMindSource(Source):
     BS = "TaiwanStockBalanceSheet"
     metric_map = {
         "REVENUE": (IS, "Revenue"),
+        "COGS": (IS, "CostOfGoodsSold"),
+        "GROSS_PROFIT": (IS, "GrossProfit"),
         "OPERATING_INCOME": (IS, "OperatingIncome"),
+        "PRE_TAX_INCOME": (IS, "PreTaxIncome"),
         "NET_INCOME": (IS, "IncomeAfterTaxes"),
         "EPS_BASIC": (IS, "EPS"),
         "ACCOUNTS_PAYABLE": (BS, "AccountsPayable"),
+        "CURRENT_ASSETS": (BS, "CurrentAssets"),
         "TOTAL_ASSETS": (BS, "TotalAssets"),
+        "CURRENT_LIABILITIES": (BS, "CurrentLiabilities"),
+        "TOTAL_LIABILITIES": (BS, "Liabilities"),
         "TOTAL_EQUITY": (BS, "Equity"),
     }
 
@@ -506,11 +611,17 @@ class EdinetSource(Source):
     metric_map = {
         # flow (income statement): read at *Duration contexts, de-cumulated
         "REVENUE": "jppfs_cor:NetSales",
+        "COGS": "jppfs_cor:CostOfSales",
+        "GROSS_PROFIT": "jppfs_cor:GrossProfit",
         "OPERATING_INCOME": "jppfs_cor:OperatingIncome",
+        "PRE_TAX_INCOME": "jppfs_cor:IncomeBeforeIncomeTaxes",
         "NET_INCOME": "jppfs_cor:ProfitLossAttributableToOwnersOfParent",
         # stock (balance sheet): read at *Instant contexts, point-in-time
         "ACCOUNTS_PAYABLE": "jppfs_cor:AccountsPayableTrade",
+        "CURRENT_ASSETS": "jppfs_cor:CurrentAssets",
         "TOTAL_ASSETS": "jppfs_cor:Assets",
+        "CURRENT_LIABILITIES": "jppfs_cor:CurrentLiabilities",
+        "TOTAL_LIABILITIES": "jppfs_cor:Liabilities",
         "TOTAL_EQUITY": "jppfs_cor:NetAssets",
     }
     note = ""
@@ -962,6 +1073,11 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
                                       if mapping.get(cid) else ""))
                     results.append(rec); continue
                 canonical = metric_map.get(code)
+                if is_derived_code(code, canonical):
+                    rec["status"] = "UNSUPPORTED_DERIVED"
+                    rec["note"] = ("computed ratio/turnover/delta metric — not a "
+                                   "single as-filed line item, so not reconcilable")
+                    results.append(rec); continue
                 if not canonical:
                     rec["status"] = "NO_MAPPING"
                     rec["note"] = "add to config/metric_map.csv"

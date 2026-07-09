@@ -68,11 +68,20 @@ Outputs:
    local reporting currency** (TSMC accounts payable `27661.85` ⇒ NT$27.66 bn).
    Every source returns full local currency, which the script divides by 1e6
    before comparing. Per-share metrics (EPS) are compared directly.
-3. **Quarters.** Compared as **discrete (3-month) quarters**, matched by the
-   period-end date's calendar year/quarter — so fiscal-vs-calendar offsets (e.g.
-   Qorvo's March year-end) are handled automatically. US Q4 and Korea Q4 are
-   derived as `FY − (Q1+Q2+Q3)`. Korea interim figures are auto-detected as
-   discrete vs. cumulative.
+3. **Quarters.** Compared as **discrete (3-month) quarters**, matched to the
+   calendar quarter the fiscal period falls in. The period-end date is snapped to
+   the **nearest calendar quarter-end** first, so 52/53-week filers whose quarters
+   end a few days into the next month (e.g. Qorvo's `2023-04-01` fiscal-Q4 end, or
+   `2020-10-03`) are attributed to the quarter they belong to (Q1, Q3) rather than
+   the following one. US Q4 and Korea Q4 are derived as `FY − (Q1+Q2+Q3)`. Korea
+   interim figures are auto-detected as discrete vs. cumulative.
+
+   *Confirmed against real data:* `financial_report_value / financial_value`
+   equals the local-currency/USD FX rate for money metrics (JPY≈137, TWD≈31,
+   KRW≈1218) and exactly 1.0 for US filers — so `financial_report_value` is the
+   as-filed local figure and `financial_value` is FX-converted to USD. Reconciled
+   values verified to the cent: Acer COGS 2019Q3 = NT$56,207M, ADTechnology
+   current assets 2020Q1 = ₩103,269M.
 4. **Tolerance.** 1% relative for money, ±0.02 absolute for EPS. Tune at the top
    of `verify_earnings.py`.
 
@@ -84,6 +93,7 @@ Outputs:
 | `MISMATCH` | **API and file disagree** — the thing you asked for |
 | `MISSING_IN_API` | source has no value for that period (e.g. JP quarterly) |
 | `NO_MAPPING` | `financial_code` not in `metric_map.csv` |
+| `UNSUPPORTED_DERIVED` | computed ratio / turnover-days / QoQ-delta metric (e.g. `NET_MARGIN`, `CASH_CONVERSION_CYCLE`, `*_QOQ`) — not a single as-filed line item, so not reconcilable against one API field |
 | `COMPANY_NOT_CONFIGURED` | `company_id` not in `company_registry.csv` |
 | `UNSUPPORTED_METRIC` | that market's source doesn't expose that metric |
 | `UNSUPPORTED_SEGMENT` | segment/geo row for a non-US company (pilot is US-only) |
@@ -129,9 +139,15 @@ Outputs:
     `UNSUPPORTED_SEGMENT`. In Japan much of this sits in XBRL text blocks
     (Socionext's geographic revenue is prose, and it's single-segment); KR/TW
     need note parsing.
-- **Metric coverage** starts with revenue, operating income, net income, EPS,
-  and a few balance-sheet items. Extend `metric_map.csv` (and the per-market
-  field maps in the source classes) to cover more `financial_code`s.
+- **Metric coverage.** Income statement: revenue, COGS, gross profit, operating
+  income, pre-tax income, net income, basic & diluted EPS. Balance sheet: current
+  assets, total assets, accounts payable, current liabilities, total liabilities,
+  total equity. (Diluted EPS is US/KR/TW only — Japan's sources don't expose it.)
+  Extend `metric_map.csv` (and the per-market field maps in the source classes)
+  to cover more `financial_code`s. **Derived** metrics — margins, turnover days,
+  cash-conversion cycle, and any `*_QOQ` / `*_YOY` delta — are reported
+  `UNSUPPORTED_DERIVED` rather than reconciled, because they're computed from
+  primitives with company-specific conventions, not filed as a single line item.
 
 ## Caching
 

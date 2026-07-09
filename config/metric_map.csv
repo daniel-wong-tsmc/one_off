@@ -3,16 +3,53 @@ financial_code,canonical_metric
 # script knows how to fetch from each market's API. Add rows as you discover
 # more codes in your data. Unmapped codes are reported as NO_MAPPING (not a
 # mismatch) so nothing is silently skipped.
+#
+# Codes mapped to DERIVED (and any code ending in _QOQ / _YOY) are reported as
+# UNSUPPORTED_DERIVED: they are computed ratios / turnover days / period deltas,
+# not a single as-filed line item, so they can't be reconciled against one API
+# field (and must never be treated as millions of currency).
+
+# --- income statement (flow) ---
 REVENUE,REVENUE
 NET_REVENUE,REVENUE
 TOTAL_REVENUE,REVENUE
+COGS,COGS
+COST_OF_GOODS_SOLD,COGS
+COST_OF_REVENUE,COGS
+GROSS_PROFIT,GROSS_PROFIT
 OPERATING_INCOME,OPERATING_INCOME
 OPERATING_PROFIT,OPERATING_INCOME
+PRE_TAX_INCOME,PRE_TAX_INCOME
+PRETAX_INCOME,PRE_TAX_INCOME
+INCOME_BEFORE_TAX,PRE_TAX_INCOME
 NET_INCOME,NET_INCOME
 NET_PROFIT,NET_INCOME
 EPS,EPS_BASIC
 EPS_BASIC,EPS_BASIC
 BASIC_EPS,EPS_BASIC
+EPS_DILUTED,EPS_DILUTED
+DILUTED_EPS,EPS_DILUTED
+
+# --- balance sheet (stock, point-in-time) ---
 ACCOUNTS_PAYABLE,ACCOUNTS_PAYABLE
+CURRENT_ASSETS,CURRENT_ASSETS
 TOTAL_ASSETS,TOTAL_ASSETS
+CURRENT_LIABILITIES,CURRENT_LIABILITIES
+TOTAL_LIABILITIES,TOTAL_LIABILITIES
 TOTAL_EQUITY,TOTAL_EQUITY
+
+# --- derived ratio / turnover / delta metrics -> UNSUPPORTED_DERIVED ---
+# (not fetchable from one line item; listed so they're categorized, not silently
+#  reported as NO_MAPPING. Any *_QOQ / *_YOY code is auto-detected too.)
+NET_MARGIN,DERIVED
+GROSS_MARGIN,DERIVED
+OPERATING_MARGIN,DERIVED
+CASH_CONVERSION_CYCLE,DERIVED
+DAYS_OF_INVENTORY,DERIVED
+DAYS_SALES_OUTSTANDING,DERIVED
+DAYS_PAYABLE_OUTSTANDING,DERIVED
+INVENTORY_TURNOVER,DERIVED
+
+# --- not yet wired (ambiguous source field); left as NO_MAPPING on purpose ---
+# MARKETABLE_SECURITIES -> which line item varies by filer (AFS vs FVTPL vs cash
+#   equivalents); map per your definition before enabling.

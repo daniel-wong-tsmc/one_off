@@ -73,18 +73,44 @@ Marketech 6196 (TW), Socionext 6526 (JP).
 | Balance sheet | ✅ | ✅ | ✅ | ✅ |
 | Segment / geo (4 files) | ✅ | — | — | — |
 
-## Key assumptions (⚠️ never validated against the user's REAL files)
+## Key assumptions — ✅ NOW VALIDATED against real sample rows
 
-1. Compares the **`financial_report_value`** column (as-filed local currency).
-   `financial_value` looks FX-converted (TSMC ratio ≈ 30.9 = TWD/USD).
-2. `financial_report_value` assumed to be in **millions of local currency**;
-   every source is divided by 1e6 before comparison.
-3. Quarters compared **discrete**, matched by **period-end calendar quarter**.
+The user provided real `FA.csv` rows (companies 154 Socionext / 157 Qorvo /
+158 Acer / 159 ADTechnology, + others) and the `company_id_mapping`. All three
+core assumptions checked out:
 
-**These three assumptions are the biggest risk.** The tool has only ever run on
-synthetic sample data. The single most valuable next step is to get the user's
-real `FA.csv` + `company_id_mapping` and calibrate units / compare-column /
-period semantics against actual values.
+1. **Compare `financial_report_value`** ✅. For every money metric,
+   `financial_report_value / financial_value` = that currency's USD FX rate
+   (JPY≈137, TWD≈31.2, KRW≈1218) and exactly 1.0 for US filers. So
+   `financial_report_value` is the as-filed local figure; `financial_value` is
+   FX-converted to USD. Comparing `financial_report_value` is correct.
+2. **Millions of local currency** ✅. Verified to the cent against live APIs:
+   Acer COGS 2019Q3 = FinMind NT$56,207,007,000 → 56,207.007 vs file 56207.01;
+   ADTechnology current assets 2020Q1 = DART ₩103,268,625,174 → 103,268.625 vs
+   file 103268.62. EPS is a raw per-share local figure (Socionext diluted EPS
+   44.28 JPY), compared directly — not millions.
+3. **Discrete quarters, period-end match** ✅ **after a fix.** `cal_key_from_date`
+   now snaps the period-end to the **nearest calendar quarter-end** before taking
+   the quarter. 52/53-week filers (Qorvo) end quarters 1–6 days into the next
+   month (2023-04-01, 2020-10-03, 2022-01-01…); the old code bucketed ~half of
+   Qorvo's history into the wrong calendar quarter. Fix validated on real Qorvo
+   revenue/pretax dates; self-test unchanged.
+
+### New this round
+- **Metric taxonomy.** Real `FA.csv` is dominated by **derived** codes (margins,
+  turnover days, cash-conversion cycle, `*_QOQ`/`*_YOY` deltas). These are now
+  categorized `UNSUPPORTED_DERIVED` (can't reconcile a computed ratio against one
+  API field, and must never be ÷1e6). Directly-fetchable codes added & wired
+  across all four sources with **verified field names**: COGS, GROSS_PROFIT,
+  PRE_TAX_INCOME, CURRENT_ASSETS, CURRENT_LIABILITIES, TOTAL_LIABILITIES,
+  EPS_DILUTED (EPS_DILUTED is US/KR/TW only — JP sources don't expose it).
+- **EDGAR YTD-ladder de-cumulation.** US filers that report an income item only
+  as year-to-date cumulatives (not discrete 90-day frames) now get all four
+  quarters via de-cumulation (additive `setdefault` fallback; every value is a
+  one-quarter difference). Verified on Qorvo pretax FY2025.
+- **Known real-data limitation:** Qorvo pretax pre-FY2025 is filed **annual-only**
+  in EDGAR companyconcept (no quarterly/YTD facts), so e.g. 2023Q1 legitimately
+  returns `MISSING_IN_API` — a data-availability gap, not a tool bug.
 
 ## Not done / next steps (roughly by value)
 
