@@ -150,10 +150,19 @@ core assumptions checked out:
    (DB HiTek/ADTech are single-segment); find a multi-segment KR filer (e.g. LG
    Electronics 066570) to validate/refine; (c) geo **operating income** isn't
    disclosed by region in KR filings (→ MISSING, by design).
-5. **Taiwan segment/geo** — **not available via any free API.** MOPS TIFRS
-   footnotes are PDF/HTML only (FinMind & TWSE OpenAPI stop at primary
-   statements). Rows return `SEGMENT_SOURCE_UNAVAILABLE`. Needs a MOPS PDF/HTML
-   footnote extractor or a paid feed (TEJ / Capital IQ / Refinitiv).
+5. **Taiwan segment/geo** — **not available via any free API** (probed concretely,
+   not just researched):
+   - TWSE OpenAPI `t187ap06_*` and FinMind `TaiwanStockFinancialStatements` are
+     statement-level only (revenue/COGS/gross/op-inc/pretax/EPS) — no segment/geo.
+   - The MOPS financial-statement HTML report (`mopsov.twse.com.tw/server-java/
+     t164sb01?step=1&CO_ID=2330&SYEAR=..&SSEASON=..&REPORT_ID=C`, big5) IS
+     reachable and has the four primary statements + investment/endorsement
+     disclosures, but **not** the 營運部門 / 地區別 revenue note — the region-revenue
+     terms (美洲/歐洲/北美/其他地區) and 部門 are absent. That note lives only in the
+     separate PDF financial-report book (財務報告書) / annual report.
+   - So TW rows return `SEGMENT_SOURCE_UNAVAILABLE`. A real implementation needs a
+     MOPS **PDF** table extractor (or the TIFRS XBRL instance if it dimensionally
+     tags 營運部門 — unverified), or a paid feed (TEJ / Capital IQ / Refinitiv).
 6. **Expand `metric_map` + per-source field maps** — income statement (rev, COGS,
    gross profit, op-inc, pre-tax, net-inc, basic/diluted EPS) and balance sheet
    (current/total assets, A/P, current/total liabilities, equity) are wired with
