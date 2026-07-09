@@ -12,5 +12,6 @@ company_id,market,api_id,fye_month,name
 # --- fill in the rest of your companies below, e.g. the four we validated: ---
 # <id>,us,QRVO,3,Qorvo Inc
 # <id>,tw,6196,12,Marketech International Corp
+# <id>,tw,2353,12,Acer Inc
 # <id>,kr,000990,12,DB HiTek Co Ltd
 # <id>,jp,6526,3,Socionext Inc

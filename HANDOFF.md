@@ -19,7 +19,7 @@ does not match**. (China was explicitly dropped from scope.)
 ```bash
 pip install -r requirements.txt
 export DART_KEY=...  EDINET_KEY=...  JQUANTS_KEY=...  SEC_USER_AGENT="you@example.com"
-python verify_earnings.py --self-test              # live check on 4 known companies
+python verify_earnings.py --self-test              # live check on 6 known companies
 python verify_earnings.py --data-dir ./data        # the user's real files
 ```
 
@@ -50,6 +50,7 @@ only `financial_value` (no `financial_report_value`).
   - `EdgarDimensional` (US segment/geo) — parses filing **XBRL instances** (`*_htm.xml`) for dimensional facts on `StatementBusinessSegmentsAxis` / `StatementGeographicalAxis`. Handles the `ConsolidationItemsAxis=OperatingSegmentsMember` qualifier. Quarterly from 10-Qs (~90d).
   - `OpenDartSource` (KR) — statements via `fnlttSinglAcntAll` (interim `thstrm_amount` auto-detected discrete-vs-cumulative; balance sheet; downloads `corpCode.xml` once, ~3.5 MB). **Segment/geo:** `segment_quarterly` downloads the full periodic report (`document.xml`, DS001), locates the note via `_note_windows`, and parses HTML tables — `_region_value` (지역별 geographic) and `_segment_revenue` (보고부문 business segment).
   - `FinMindSource` (TW) — `TaiwanStockFinancialStatements` (discrete quarters) + `TaiwanStockBalanceSheet`. Equity field is `Equity`.
+  - `MopsTwSource` (TW segment/geo) — downloads the consolidated IFRS financial-report book (`…_AI1.pdf`) from `doc.twse.com.tw` (two-step: POST step=9 → follow the `/pdf/…` link; no key) and parses its text layer with `pdfplumber`. **Geographic** revenue from the 營業收入 note's 地區別 table (regions-as-rows; discrete 3-month column + 9-month cumulative column; Q4 = full-year − 9-month). **Business-segment** revenue from the 部門資訊 note's 來自外部客戶收入 row (segments-as-columns; Q4 = full-year − Q1–Q3). Unit is NT$ 仟元 (×1e3). Every table is validated against its printed total → a misread returns nothing (never a false MATCH). Caches only the extracted note text, not the multi-MB PDF.
   - `EdinetSource` (JP) — discovers annual (docType 120) + quarterly (140) reports by scanning statutory filing windows (cached per date; **slow first run per company**), reads YTD `*Duration` values and **de-cumulates**; balance sheet via `*Instant`. **EPS excluded** (YTD EPS is restated across stock splits → differencing invalid).
   - `JQuantsSource` (JP) — V2 `/fins/summary` (TDnet 決算短信); YTD values de-cumulated; free plan = rolling ~2yr + ~12-week delay.
   - `JapanSource` — composite: EDINET (history) + J-Quants (recent), J-Quants wins on overlap.
@@ -58,8 +59,8 @@ only `financial_value` (no `financial_report_value`).
   `EdinetSource.segment_quarterly` (dimensional segment/geo facts from EDINET
   reports, de-cumulated); KR → `OpenDartSource.segment_quarterly` (parses the
   영업부문/보고부문 note tables from `document.xml`; geographic AND business-segment
-  revenue, all four quarters); TW → `SEGMENT_SOURCE_UNAVAILABLE` (footnote-only
-  MOPS PDF, no free API).
+  revenue, all four quarters); TW → `MopsTwSource.segment_quarterly` (geographic
+  AND business-segment revenue parsed from the MOPS financial-report-book PDF).
 
 ## Config (user-editable, drives everything)
 
@@ -75,15 +76,18 @@ only `financial_value` (no `financial_report_value`).
 ## Verified working (self-test, live)
 
 All four markets, income statement + balance sheet; US all four `Seg_*` files.
-Self-test = 16 MATCH / 1 MISMATCH (planted) / 1 MISSING (Qorvo geo op-income,
+Self-test = **21 MATCH** / 1 MISMATCH (planted) / 1 MISSING (Qorvo geo op-income,
 not disclosed) / 1 not-configured. Companies: Qorvo (US), DB HiTek (KR),
-Marketech 6196 (TW), Socionext 6526 (JP).
+Marketech 6196 (TW), Socionext 6526 (JP), **TSMC 2330 (TW geo)**, **Acer 2353 (TW
+segment)**. The 5 new TW rows all MATCH live: TSMC geographic revenue US/China/
+Japan 2023Q3 (discrete) + US 2023Q4 (annual − 9-month de-cumulation), and Acer
+資通訊產品事業群 2023Q3. (Baseline before the TW work was 16 MATCH.)
 
 | | US | KR | TW | JP |
 |---|---|---|---|---|
 | Income statement (rev/COGS/op-inc/pre-tax/net-inc/EPS) | ✅ | ✅ | ✅ | ✅ (EPS recent-only, J-Quants; diluted EPS n/a) |
 | Balance sheet (assets/liabs/equity) | ✅ | ✅ | ✅ | ✅ |
-| Segment / geo (4 files) | ✅ | 🟡 geo + segment revenue, all 4 qtrs (DART notes) | ⛔ footnote-only (MOPS PDF) | ✅ (EDINET dimensional XBRL) |
+| Segment / geo (4 files) | ✅ | 🟡 geo + segment revenue, all 4 qtrs (DART notes) | 🟡 geo + segment revenue (MOPS PDF book) | ✅ (EDINET dimensional XBRL) |
 
 ## Key assumptions — ✅ NOW VALIDATED against real sample rows
 
@@ -163,19 +167,39 @@ core assumptions checked out:
      return nothing (no false match).
    - **Skipped by request:** segment & geographic **operating income** (not
      consistently disclosed) → MISSING.
-5. **Taiwan segment/geo** — **not available via any free API** (probed concretely,
-   not just researched):
-   - TWSE OpenAPI `t187ap06_*` and FinMind `TaiwanStockFinancialStatements` are
-     statement-level only (revenue/COGS/gross/op-inc/pretax/EPS) — no segment/geo.
-   - The MOPS financial-statement HTML report (`mopsov.twse.com.tw/server-java/
-     t164sb01?step=1&CO_ID=2330&SYEAR=..&SSEASON=..&REPORT_ID=C`, big5) IS
-     reachable and has the four primary statements + investment/endorsement
-     disclosures, but **not** the 營運部門 / 地區別 revenue note — the region-revenue
-     terms (美洲/歐洲/北美/其他地區) and 部門 are absent. That note lives only in the
-     separate PDF financial-report book (財務報告書) / annual report.
-   - So TW rows return `SEGMENT_SOURCE_UNAVAILABLE`. A real implementation needs a
-     MOPS **PDF** table extractor (or the TIFRS XBRL instance if it dimensionally
-     tags 營運部門 — unverified), or a paid feed (TEJ / Capital IQ / Refinitiv).
+5. **Taiwan segment/geo** — **DONE for geographic AND business-segment revenue**
+   via the MOPS financial-report-book PDF (`MopsTwSource`). The path that worked,
+   after ruling the others out:
+   - **XBRL is a dead end.** TWSE OpenAPI `t187ap06_*` and FinMind
+     `TaiwanStockFinancialStatements` are statement-level only. The MOPS t164
+     report (`mopsov.twse.com.tw/server-java/t164sb01?…&REPORT_ID=C`, big5) is the
+     XBRL-*derived* HTML view and, like the underlying instance, carries only the
+     primary statements + investment/endorsement disclosures — **not** the 營運部門
+     / 地區別 revenue note. Taiwan's public XBRL does not dimensionally tag the note
+     (unlike EDGAR/EDINET). Confirmed by inspecting the t164 output directly.
+   - **The note lives only in the PDF financial-report book (財務報告書).** It IS
+     downloadable, keyless: POST to `doc.twse.com.tw/server-java/t57sb01` with
+     `step=9&kind=A&co_id=<coid>&filename=<YYYY0Q>_<coid>_AI1.pdf`, then follow the
+     returned `/pdf/…` link. `AI1` = consolidated IFRS book (what we want).
+   - **`MopsTwSource` parses it** (see architecture). Geographic 地區別 table has a
+     discrete 3-month column (Q1–Q3 direct) + a 9-month cumulative column (Q4 =
+     annual − 9M). Business-segment 部門資訊 note gives the discrete 來自外部客戶收入
+     row per quarter (Q4 = annual − Q1–Q3). Unit is 仟元 (×1e3); **the note slice
+     often omits the unit header, so the source DEFAULTS to 1e3** (the regulatory
+     standard) rather than trusting `_unit_multiplier`'s 1.0 fallback — this was a
+     real bug caught by the Acer sum-check (values came out 1000× low).
+   - **Validated:** TSMC (2330) geographic revenue 2023 Q1–Q4 for all six regions,
+     discrete quarters summing exactly to the disclosed annual (US 2023Q3 =
+     360,671 M ≈ 66%, matches FinMind total revenue); Acer (2353) business-segment
+     revenue (資通訊產品事業群 / 其他事業群) summing to the annual. TSMC is
+     single-segment (foundry) so it has no business-segment split — correct empty.
+   - **Limits / fragility (documented honestly):** the note is PDF text — companies
+     whose 部門資訊 table is typeset vertically (character-per-line, e.g. Marketech
+     6196) don't parse; and many TW companies don't disclose a 地區別 table at all
+     (Acer/Marketech don't). Both cases → `MISSING_IN_API`, never a false MATCH
+     (guarded by the per-table sum-to-total check). Op-income by segment/region is
+     skipped (rarely disclosed). PDFs are multi-MB → slow on first fetch, cached
+     after (only the extracted note text is cached).
 6. **Expand `metric_map` + per-source field maps** — income statement (rev, COGS,
    gross profit, op-inc, pre-tax, net-inc, basic/diluted EPS) and balance sheet
    (current/total assets, A/P, current/total liabilities, equity) are wired with

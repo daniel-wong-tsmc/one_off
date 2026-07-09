@@ -9,7 +9,7 @@ does not match**.
 |--------|--------|-----------|----------|-------------|
 | 🇺🇸 US | SEC EDGAR | none (User-Agent only) | quarterly, full history | ✅ EDGAR dimensional XBRL |
 | 🇰🇷 Korea | OpenDART | `DART_KEY` (free) | quarterly, full history | 🟡 geographic **and** business-segment revenue (all 4 quarters) from the DART note tables |
-| 🇹🇼 Taiwan | FinMind | `FINMIND_TOKEN` optional | quarterly, full history | ⛔ footnote-only (MOPS TIFRS PDF), no free API |
+| 🇹🇼 Taiwan | FinMind (statements) + MOPS PDF book (segment/geo) | `FINMIND_TOKEN` optional; MOPS needs none | quarterly, full history | 🟡 geographic **and** business-segment revenue, parsed from the MOPS financial-report-book PDF |
 | 🇯🇵 Japan | J-Quants V2 + EDINET | `JQUANTS_KEY`, `EDINET_KEY` (free) | quarterly recent ~2yr (J-Quants) + pre-2024 quarterly & annual (EDINET 四半期/有価証券報告書) | ✅ EDINET dimensional XBRL |
 
 ## Setup
@@ -47,7 +47,7 @@ a name can't be turned into a KRX/TWSE/sec code reliably, so you still fill in
 # your files live in ./data (FA.csv, Seg_*.csv). Filenames configurable in code.
 python verify_earnings.py --data-dir ./data --out-dir ./out
 
-# quick live check against 4 known-good companies (needs the two keys):
+# quick live check against 6 known-good companies (US/KR/TW/JP + TSMC & Acer TW seg/geo):
 python verify_earnings.py --self-test
 ```
 
@@ -96,8 +96,7 @@ Outputs:
 | `UNSUPPORTED_DERIVED` | computed ratio / turnover-days / QoQ-delta metric (e.g. `NET_MARGIN`, `CASH_CONVERSION_CYCLE`, `*_QOQ`) — not a single as-filed line item, so not reconcilable against one API field |
 | `COMPANY_NOT_CONFIGURED` | `company_id` not in `company_registry.csv` |
 | `UNSUPPORTED_METRIC` | that market's source doesn't expose that metric |
-| `SEGMENT_SOURCE_UNAVAILABLE` | segment/geo row for **Taiwan** — that data is footnote-only (MOPS TIFRS PDF) and not in any free API |
-| `NO_SEGMENT_MAPPING` | US/JP segment/geo label not resolvable — add to `segment_members.csv` |
+| `NO_SEGMENT_MAPPING` | business-segment label not resolvable — add to `segment_members.csv` (US: XBRL member; JP: member substring; KR: 부문 name; TW: 部門 name). Geographic labels auto-match by region name |
 | `SOURCE_UNAVAILABLE` | key missing for that market |
 | `BAD_FILE_VALUE` / `ERROR` | unparseable value / fetch error |
 
@@ -120,10 +119,9 @@ Outputs:
   - Any period neither source can reach (older than the J-Quants window *and*
     with no EDINET filing) returns `MISSING_IN_API`. Because the J-Quants free
     window rolls forward, cache older quarters sooner rather than later.
-- **Segment & geographic files (`Seg_*`) — US and Japan supported; Korea and
-  Taiwan not available via free API.** These files hold business-segment and
-  geographic splits, which live in filing footnotes rather than clean top-line
-  API fields.
+- **Segment & geographic files (`Seg_*`) — all four markets supported for
+  revenue.** These files hold business-segment and geographic splits, which live
+  in filing footnotes rather than clean top-line API fields.
   - **US (EDGAR).** Dimensional XBRL facts from the filing instances (`Revenues` /
     `OperatingIncomeLoss` on `StatementBusinessSegmentsAxis` /
     `StatementGeographicalAxis`, with the `OperatingSegmentsMember` qualifier
@@ -164,11 +162,36 @@ Outputs:
     discrete quarters summing exactly to the disclosed 9-month figure and FY2023
     DS = ₩66.59 tn matching the filing. *Scope:* segment/geographic **operating
     income** is skipped (not consistently disclosed) → `MISSING_IN_API`.
-  - **Taiwan.** Segment/geographic data is **footnote-only** (TIFRS 附註, PDF/HTML
-    on MOPS) and exposed by **no free API** — FinMind and the TWSE OpenAPI stop at
-    the primary statements. Those rows return `SEGMENT_SOURCE_UNAVAILABLE`.
-    Reconciling them would need a MOPS PDF/HTML footnote extractor or a paid feed
-    (TEJ / Capital IQ / Refinitiv).
+  - **Taiwan (MOPS financial-report book, PDF).** TW segment/geographic revenue
+    is disclosed only in the notes to the financial statements — **not** in
+    FinMind, the TWSE OpenAPI, or the MOPS t164 XBRL-derived HTML view (all of
+    which stop at the primary statements). The tool downloads the consolidated
+    IFRS financial-report book (`…_AI1.pdf`) from the TWSE document server
+    (`doc.twse.com.tw`, no key) and parses its text layer:
+    - **Geographic revenue** from the 營業收入 disaggregation note's **地區別**
+      (revenue-by-region) table — regions-as-rows, with a discrete 3-month column
+      and a 9-month cumulative column. Q1–Q3 read the discrete column directly;
+      Q4 = full-year (annual book) − 9-month. Region names are canonicalised in
+      both Traditional Chinese and English (台灣/Taiwan, 美國/US/North America,
+      中國/China, 日本/Japan, 歐洲、中東及非洲/EMEA, 其他/Other). Verified on **TSMC**:
+      2023 quarterly geographic revenue (US 2023Q3 = NT$360,671 M ≈ 66%) with the
+      discrete quarters summing exactly to the disclosed annual figures.
+    - **Business-segment revenue** from the 部門資訊 note's 來自外部客戶收入
+      (external-customer revenue) row — segments-as-columns; discrete quarters
+      (Q4 = full-year − Q1–Q3). Map each label to the note's Chinese 部門 name in
+      `segment_members.csv` (e.g. `158,ICT,資通訊產品事業群`). Verified on **Acer**
+      (資通訊產品事業群 / 其他事業群, quarters summing to the annual). Single-segment
+      filers (TSMC is one — foundry only) correctly return nothing.
+    - Every extracted table is validated against its own printed total (region /
+      segment values must sum to the total, else the parse is rejected) so a
+      misread yields `MISSING_IN_API`, never a false `MATCH`. Values are NT$
+      thousands (仟元). *Scope:* revenue only — segment/geographic **operating
+      income** is skipped (rarely disclosed by region/segment) → `MISSING_IN_API`.
+      *Caveats:* the book is a multi-MB PDF (slow on first fetch, then cached);
+      companies whose note is typeset vertically (character-per-line) don't parse
+      → `MISSING_IN_API`; companies that don't disclose a region/segment split
+      (many, e.g. Acer/Marketech have no 地區別 table) → `MISSING_IN_API`.
+      Needs `pdfplumber` (in `requirements.txt`).
 - **Metric coverage.** Income statement: revenue, COGS, gross profit, operating
   income, pre-tax income, net income, basic & diluted EPS. Balance sheet: current
   assets, total assets, accounts payable, current liabilities, total liabilities,

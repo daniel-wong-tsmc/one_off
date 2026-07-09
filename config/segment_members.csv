@@ -26,5 +26,11 @@ company_id,label,member
 # 201,Semiconductors,DS
 # 201,Device eXperience,DX
 #
-# Taiwan: segment/geo is footnote-only (MOPS TIFRS PDF) and not in any free API,
-# so those rows report SEGMENT_SOURCE_UNAVAILABLE regardless of what is mapped here.
+# Taiwan (MOPS financial-report-book PDF): geographic revenue (地區別) matches by
+# region name automatically (Traditional-Chinese and English are recognised — 台灣,
+# 美國/US/North America, 中國/China, 日本/Japan, 歐洲、中東及非洲/EMEA, 其他/Other), so
+# no mapping is needed. BUSINESS segments: `member` is the Chinese 部門 name used in
+# the 部門資訊 note's 來自外部客戶收入 row, matched as a substring, e.g. Acer (2353):
+# 158,ICT,資通訊產品事業群
+# 158,Other,其他事業群
+# (TSMC 2330 is single-segment — foundry only — so it has no business-segment split.)

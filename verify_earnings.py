@@ -15,7 +15,7 @@ Sources (all free):
 Usage:
   export DART_KEY=...  EDINET_KEY=...   # (FINMIND_TOKEN optional)
   python verify_earnings.py --data-dir ./data --out-dir ./out
-  python verify_earnings.py --self-test        # live check against 4 known companies
+  python verify_earnings.py --self-test        # live check against 6 known companies
 
 See README.md for the assumptions this makes about your files (units, which
 value column is compared, quarter semantics).
@@ -464,7 +464,10 @@ def _kr_num(s: str):
 
 
 def _unit_multiplier(text: str) -> float:
-    """Read the '(단위: 백만원)' hint. Returns won-per-reported-unit."""
+    """Read the '(단위: 백만원)' / '(單位：新台幣仟元)' hint. Returns
+    local-currency-per-reported-unit. Covers both the Korean DART notes and the
+    Taiwanese MOPS financial-report book (which reports in NT$ thousands, 仟元)."""
+    # Korean
     if "조원" in text:
         return 1e12
     if "억원" in text:
@@ -472,6 +475,11 @@ def _unit_multiplier(text: str) -> float:
     if "백만원" in text:
         return 1e6
     if "천원" in text:
+        return 1e3
+    # Taiwanese (Traditional Chinese): 仟元/千元 = thousands, 佰萬元/百萬元 = millions
+    if "佰萬元" in text or "百萬元" in text:
+        return 1e6
+    if "仟元" in text or "千元" in text:
         return 1e3
     return 1.0
 
@@ -489,11 +497,24 @@ _REGION_CANON = {
     "대만": "TW", "TAIWAN": "TW",
     "일본": "JP", "JAPAN": "JP",
     "홍콩": "HK", "HONGKONG": "HK",
+    # Traditional Chinese region names (Taiwan MOPS financial-report book 地區別)
+    "台灣": "TW", "臺灣": "TW",
+    "美國": "US", "北美": "US", "北美洲": "US", "美洲": "US", "NORTHAMERICA": "US",
+    "AMERICA": "US", "AMERICAS": "US",
+    "中國": "CN", "中國大陸": "CN", "大陸": "CN",
+    "日本": "JP",
+    "歐洲、中東及非洲": "EMEA", "歐洲中東及非洲": "EMEA", "歐非中東": "EMEA",
+    "歐中非": "EMEA", "EMEA": "EMEA",
+    "歐洲": "EU",
+    "亞洲": "ASIA", "其他亞洲": "ASIA",
+    "其他": "OTHER", "其它": "OTHER", "其他地區": "OTHER",
     "싱가포르": "SG", "SINGAPORE": "SG",
     "유럽": "EU", "EUROPE": "EU", "구주": "EU", "유럽연합": "EU",
     "독일": "DE", "GERMANY": "DE",
     "아시아": "ASIA", "ASIA": "ASIA", "아태": "ASIA", "아시아태평양": "ASIA",
-    "북미": "NA", "북미주": "NA", "NORTHAMERICA": "NA",
+    "북미": "NA", "북미주": "NA",   # Korean 'North America' region stays NA;
+    # English 'North America'/'Americas' unify to US (above) — that is TSMC's
+    # single Americas region (美國/North America), which must reconcile as US.
     "중남미": "LATAM", "남미": "LATAM", "LATINAMERICA": "LATAM",
     "중동": "ME", "MIDDLEEAST": "ME", "중동아프리카": "MEA",
     "아프리카": "AF", "AFRICA": "AF",
@@ -509,7 +530,7 @@ _SPECIFIC_REGIONS = set(_REGION_CANON.values()) - {"OTHER", "TOTAL"}
 
 
 def _canon_region(s: str) -> str:
-    key = re.sub(r"[\s()\.\-_/]", "", s).upper()
+    key = re.sub(r"[\s()\.\-_/、，,&・･]", "", s).upper()
     return _REGION_CANON.get(key, key)
 
 
@@ -980,6 +1001,296 @@ class FinMindSource(Source):
             if row.get("type") == typ:
                 out[cal_key_from_date(row["date"])] = float(row["value"])
         return out
+
+
+# ---- Taiwan segment/geo: MOPS financial-report book (PDF notes) ------------ #
+# TW segment & geographic revenue is disclosed only in the notes to the financial
+# statements — the 營業收入 disaggregation (地區別, revenue by region) and the
+# 部門資訊 note (來自外部客戶收入, external-customer revenue by reportable segment).
+# Neither the TWSE/FinMind statement APIs nor the MOPS t164 XBRL-derived HTML view
+# carry the note; it lives only in the PDF financial-report book (財務報告書) on the
+# TWSE document server. We download the consolidated IFRS book (…_AI1.pdf) and
+# parse the note tables from its text layer.
+#
+# Revenue only (op-income by segment/region is not consistently disclosed — same
+# as Korea, and skipped by request). Interim books carry a discrete 3-month column
+# (地區別) so Q1–Q3 are read directly; Q4 = full-year − 9-month. Segment tables give
+# a discrete 3-month table per quarter, so Q4 = full-year − (Q1+Q2+Q3).
+class MopsTwSource(Source):
+    market = "tw"
+    DOC = "https://doc.twse.com.tw/server-java/t57sb01"
+    UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/120 Safari/537.36")
+    _NUMTOK = re.compile(r"\(?\$?\s?-?[\d,]+\)?")
+    _Q_START = {1: 1, 2: 4, 3: 7, 4: 10}
+    _DISC_RANGE = {1: (1, 3), 2: (4, 6), 3: (7, 9)}
+
+    def __init__(self):
+        try:
+            import pdfplumber  # noqa: F401
+            self.available = True
+            self.note = ""
+        except ImportError:
+            self.available = False
+            self.note = "pdfplumber not installed (pip install -r requirements.txt)"
+
+    # -- download the consolidated book and cache only the two note texts -- #
+    def _pdf_bytes(self, coid, gy, gq):
+        fn = f"{gy}{gq:02d}_{coid}_AI1.pdf"
+        try:
+            r = SESSION.post(self.DOC,
+                             data={"step": "9", "kind": "A", "co_id": coid,
+                                   "filename": fn},
+                             headers={"User-Agent": self.UA, "Referer": self.DOC},
+                             timeout=90)
+            m = re.search(r"/pdf/[0-9A-Za-z_]+\.pdf", r.text)
+            if not m:
+                return None
+            p = SESSION.get("https://doc.twse.com.tw" + m.group(0),
+                            headers={"User-Agent": self.UA, "Referer": self.DOC},
+                            timeout=180)
+            if p.status_code != 200 or p.content[:4] != b"%PDF":
+                return None
+            return p.content
+        except Exception:
+            return None
+
+    def _anchor_ok(self, kind, tn):
+        if kind == "geo":
+            return ("地區別" in tn
+                    and ("美國" in tn or "台灣" in tn or "臺灣" in tn))
+        return "來自外部客戶收入" in tn                # kind == "seg"
+
+    def _note_text(self, coid, gy, gq, kind):
+        """The 地區別 (kind='geo') or 部門資訊 (kind='seg') note text of this
+        company's consolidated book, or None. Extracts page-by-page and stops at
+        the note (they sit deep in the book, so this avoids parsing every page).
+        Caches the extracted slice only (the book itself is several MB)."""
+        ck = f"mops_tw_note_{kind}_{coid}_{gy}{gq:02d}"
+        c = _cache_get(ck)
+        if c is not None:
+            return c or None            # a cached miss is stored as ""
+        data = self._pdf_bytes(coid, gy, gq)
+        if not data:
+            _cache_put(ck, "")
+            return None
+        import pdfplumber
+        found = ""
+        try:
+            with pdfplumber.open(io.BytesIO(data)) as pdf:
+                pages = pdf.pages
+                prev = ""
+                for i in range(len(pages)):
+                    t = pages[i].extract_text() or ""
+                    if self._anchor_ok(kind, re.sub(r"\s", "", t)):
+                        nxt = (pages[i + 1].extract_text() or ""
+                               if i + 1 < len(pages) else "")
+                        found = prev + "\n" + t + "\n" + nxt
+                        break
+                    prev = t
+        except Exception:
+            pass
+        _cache_put(ck, found)
+        return found or None
+
+    @staticmethod
+    def _tw_mult(text):
+        """NT$ per reported unit for a MOPS book note. The consolidated financial-
+        report book is filed in thousands (仟元) by regulation; a note only rarely
+        restates the unit, and the per-page slice may omit the '(單位：新台幣仟元)'
+        header entirely — so default to thousands rather than to 1 (which
+        _unit_multiplier does), and only override when a note explicitly prints a
+        millions unit."""
+        if "佰萬元" in text or "百萬元" in text:
+            return 1e6
+        return 1e3
+
+    @staticmethod
+    def _num(tok):
+        s = tok.replace(",", "").replace("$", "").strip()
+        neg = s.startswith("(") and s.endswith(")")
+        if neg:
+            s = s[1:-1]
+        try:
+            v = float(s)
+        except ValueError:
+            return None
+        return -v if neg else v
+
+    def _nums(self, line):
+        return [v for v in (self._num(t) for t in self._NUMTOK.findall(line)
+                            if any(c.isdigit() for c in t)) if v is not None]
+
+    @staticmethod
+    def _row_region(line):
+        label = re.sub(r"[^一-鿿A-Za-z、]", "", line)
+        return _canon_region(label) if label else None
+
+    # ---- geographic (地區別) ---- #
+    def _geo_table(self, coid, gy, q):
+        """{region_canon: {'discrete'|'ytd'|'fullyear': value_NT$}} for the
+        report covering calendar-year gy quarter q, or None. Values already
+        multiplied by the note's unit (仟元 → 1e3). Rejects the parse if the
+        region rows don't sum to the printed total (guards against misreads)."""
+        text = self._note_text(coid, gy, q, "geo")
+        if not text:
+            return None
+        lines = text.split("\n")
+        hdr_k = prev = None
+        for k, ln in enumerate(lines):
+            if re.sub(r"\s", "", ln).find("地區別") < 0:
+                continue
+            regions = {self._row_region(w) for w in lines[k + 1:k + 12]}
+            if len(regions & _SPECIFIC_REGIONS) >= 2:
+                hdr_k, prev = k, (lines[k - 1] if k else "")
+                break
+        if hdr_k is None:
+            return None
+        mult = self._tw_mult(text)
+        if "年度" in lines[hdr_k]:                       # annual book: full year
+            cols = {"fullyear": 0}
+        else:                                            # interim: pick columns
+            starts = [(int(y), int(m)) for y, m in
+                      re.findall(r"(\d+)年(\d+)月\d+日", prev)]
+            if not starts:
+                return None
+            cy = max(y for y, _ in starts)
+            disc = next((i for i, (y, m) in enumerate(starts)
+                         if y == cy and m == self._Q_START[q]), None)
+            ytd = next((i for i, (y, m) in enumerate(starts)
+                        if y == cy and m == 1), None)
+            cols = {"discrete": disc, "ytd": ytd}
+        rows, total = {}, None
+        for ln in lines[hdr_k + 1:]:
+            reg = self._row_region(ln)
+            nums = self._nums(ln)
+            if reg in _SPECIFIC_REGIONS or reg == "OTHER":
+                if nums:
+                    rows[reg] = nums
+            elif reg is None and nums and rows:          # the $-total line
+                total = nums
+                break
+            elif reg is None and not nums:
+                continue
+            elif rows:
+                break
+        if len(rows) < 2 or total is None:
+            return None
+        for role, idx in cols.items():                   # consistency guard
+            if idx is None or idx >= len(total):
+                continue
+            s = sum(r[idx] for r in rows.values() if idx < len(r))
+            if abs(s - total[idx]) > max(1.0, abs(total[idx]) * 1e-4):
+                return None
+        out = {}
+        for reg, nums in rows.items():
+            out[reg] = {role: nums[idx] * mult
+                        for role, idx in cols.items()
+                        if idx is not None and idx < len(nums)}
+        return out
+
+    # ---- business segment (部門資訊 → 來自外部客戶收入) ---- #
+    def _seg_table(self, coid, gy, q):
+        """{'fullyear'|'discrete': {seg_header: value_NT$}, 'total': value} for the
+        external-customer revenue row of the report, or None. Interim books show a
+        discrete 3-month table; annual books a full-year table."""
+        text = self._note_text(coid, gy, q, "seg")
+        if not text:
+            return None
+        lines = text.split("\n")
+        mult = self._tw_mult(text)
+        annual = (q == 4)
+        # find the period header, then the segment-name header, then the
+        # 來自外部客戶收入 row directly under it
+        role = "fullyear" if annual else "discrete"
+        want_range = None if annual else self._DISC_RANGE[q]
+        for k, ln in enumerate(lines):
+            lnn = re.sub(r"\s", "", ln)
+            if annual:
+                if not re.search(r"\d+年度", lnn):
+                    continue
+            else:
+                m = re.search(r"\d+年(\d+)月至(\d+)月", lnn)
+                if not m or (int(m.group(1)), int(m.group(2))) != want_range:
+                    continue
+            hdr = lines[k + 1] if k + 1 < len(lines) else ""
+            row = None
+            for j in range(k + 1, min(k + 6, len(lines))):
+                if "來自外部客戶收入" in re.sub(r"\s", "", lines[j]):
+                    row = lines[j]
+                    break
+            if row is None:
+                continue
+            seg_headers = [t for t in hdr.split()
+                           if not any(kw in t for kw in
+                                      ("調整", "沖銷", "調節", "沖轉", "合", "計", "總"))]
+            vals = self._nums(row)
+            if len(vals) < 2 or not seg_headers:
+                continue
+            total = vals[-1]
+            seg_vals = vals[:-1]                          # pre-total columns
+            if len(seg_vals) != len(seg_headers):
+                continue                                  # can't align → skip
+            if abs(sum(seg_vals) - total) > max(1.0, abs(total) * 1e-4):
+                continue                                  # inconsistent → skip
+            return {role: {h: v * mult for h, v in zip(seg_headers, seg_vals)},
+                    "total": total * mult}
+        return None
+
+    def segment_quarterly(self, api_id, fye_month, years, label, want, is_geo):
+        """Discrete-quarter {(cal_y, cal_q): value_NT$} for a Taiwanese GEOGRAPHIC
+        region (地區別) or business-SEGMENT (部門資訊) revenue label. Revenue only.
+        Geographic labels are auto-matched by region name; business-segment labels
+        must be mapped to the note's Chinese 部門 name in segment_members.csv."""
+        if not self.available or want == "opincome":
+            return {}
+        coid = api_id.strip()
+        region = _canon_region(label) if is_geo else None
+        seg_target = None if is_geo else _seg_norm(label)
+        yrs = (sorted(set(int(y) for y in years)) if years
+               else range(2018, datetime.date.today().year + 1))
+        out = {}
+        for year in yrs:
+            for q in (1, 2, 3, 4):
+                try:
+                    v = (self._geo_quarter(coid, year, q, region) if is_geo
+                         else self._seg_quarter(coid, year, q, seg_target))
+                except Exception:
+                    v = None
+                if v is not None:
+                    out[(year, q)] = v
+        return out
+
+    def _geo_quarter(self, coid, year, q, region):
+        if q in (1, 2, 3):
+            t = self._geo_table(coid, year, q)
+            return t.get(region, {}).get("discrete") if t else None
+        fy = self._geo_table(coid, year, 4)               # annual book
+        yt = self._geo_table(coid, year, 3)               # 9-month cumulative
+        if not fy or not yt:
+            return None
+        a = fy.get(region, {}).get("fullyear")
+        c = yt.get(region, {}).get("ytd")
+        return (a - c) if (a is not None and c is not None) else None
+
+    def _seg_quarter(self, coid, year, q, seg_target):
+        def pick(tbl):
+            if not tbl:
+                return None
+            body = tbl.get("fullyear") or tbl.get("discrete") or {}
+            for h, v in body.items():
+                if seg_target and seg_target in _seg_norm(h):
+                    return v
+            return None
+        if q in (1, 2, 3):
+            return pick(self._seg_table(coid, year, q))
+        fy = pick(self._seg_table(coid, year, 4))
+        if fy is None:
+            return None
+        parts = [pick(self._seg_table(coid, year, i)) for i in (1, 2, 3)]
+        if any(p is None for p in parts):
+            return None
+        return fy - sum(parts)
 
 
 # ---- Japan: EDINET (annual + quarterly securities reports, XBRL) ---------- #
@@ -1457,6 +1768,7 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
     sources = {s.market: s for s in
                (EdgarSource(), OpenDartSource(), FinMindSource(), JapanSource())}
     edgar_dim = EdgarDimensional(sources["us"])
+    mops_tw = MopsTwSource()
     seg_members = seg_members or {}
     mapping = mapping or {}
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1532,15 +1844,6 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
                         rec["status"] = "BAD_FILE_VALUE"; results.append(rec); continue
                     rec["file_value"] = fv
 
-                    # Taiwan: segment & geographic figures live only in the TIFRS
-                    # footnotes (PDF/HTML on MOPS), which no free API exposes as
-                    # structured data — so we can't reconcile them yet.
-                    if market == "tw":
-                        rec["status"] = "SEGMENT_SOURCE_UNAVAILABLE"
-                        rec["note"] = ("TW segment/geo is footnote-only (MOPS TIFRS); "
-                                       "not in the free API (see README)")
-                        results.append(rec); continue
-
                     member = seg_members.get((cid, label.upper()))
                     if market == "us":
                         if not member and is_geo:
@@ -1561,6 +1864,14 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
                         rec["note"] = (f"map '{label}' in config/segment_members.csv "
                                        "(KR: the 영업부문 name in the note, e.g. 'DS')")
                         results.append(rec); continue
+                    elif market == "tw" and not is_geo and not member:
+                        # TW business segments need the note's 部門 name (labels are
+                        # company-specific); geographic matches by region name.
+                        rec["status"] = "NO_SEGMENT_MAPPING"
+                        rec["note"] = (f"map '{label}' in config/segment_members.csv "
+                                       "(TW: the 部門 name in the 部門資訊 note, "
+                                       "e.g. '資通訊產品事業群')")
+                        results.append(rec); continue
 
                     try:
                         if market == "us":
@@ -1578,6 +1889,12 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
                             # KR geographic revenue: matched by region name (a
                             # segment_members.csv override can rename the label).
                             ser = sources["kr"].segment_quarterly(
+                                comp["api_id"], comp["fye_month"],
+                                years_by_company.get(cid), member or label, want, is_geo)
+                        elif market == "tw":
+                            # TW geographic revenue: matched by region name; business
+                            # segment: mapped 部門 name. Parsed from the MOPS PDF book.
+                            ser = mops_tw.segment_quarterly(
                                 comp["api_id"], comp["fye_month"],
                                 years_by_company.get(cid), member or label, want, is_geo)
                         else:
@@ -1710,7 +2027,7 @@ def main():
                          "'.csv' suffix is tolerated. Supplies display names and "
                          "flags ids missing from company_registry.csv")
     ap.add_argument("--self-test", action="store_true",
-                    help="run live against the 4 validated companies in sample_data/")
+                    help="run live against the 6 validated companies in sample_data/")
     args = ap.parse_args()
 
     cfg = Path(args.config_dir)
