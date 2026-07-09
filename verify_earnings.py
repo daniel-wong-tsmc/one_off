@@ -443,8 +443,9 @@ def _html_tables(html: str):
     for tbl in re.findall(r"<TABLE\b[^>]*>(.*?)</TABLE>", html, re.S | re.I):
         rows = []
         for tr in re.findall(r"<TR\b[^>]*>(.*?)</TR>", tbl, re.S | re.I):
+            # DART markup uses <TH>/<TD> and also <TE> for body cells
             cells = [_html_cell(c) for c in
-                     re.findall(r"<T[HD]\b[^>]*>(.*?)</T[HD]>", tr, re.S | re.I)]
+                     re.findall(r"<T[HDE]\b[^>]*>(.*?)</T[HDE]>", tr, re.S | re.I)]
             if any(cells):
                 rows.append(cells)
         if rows:
@@ -475,18 +476,28 @@ def _unit_multiplier(text: str) -> float:
 # matches the row label in a Korean 지역별 table.
 _REGION_CANON = {
     "한국": "KR", "국내": "KR", "대한민국": "KR", "KOREA": "KR", "SOUTHKOREA": "KR",
-    "중국": "CN", "CHINA": "CN", "중화인민공화국": "CN",
+    "중국": "CN", "CHINA": "CN", "중화인민공화국": "CN", "대중국": "CN", "중화권": "CN",
     "미국": "US", "미주": "US", "USA": "US", "UNITEDSTATES": "US", "US": "US",
     "대만": "TW", "TAIWAN": "TW",
     "일본": "JP", "JAPAN": "JP",
     "홍콩": "HK", "HONGKONG": "HK",
     "싱가포르": "SG", "SINGAPORE": "SG",
-    "유럽": "EU", "EUROPE": "EU", "구주": "EU",
+    "유럽": "EU", "EUROPE": "EU", "구주": "EU", "유럽연합": "EU",
     "독일": "DE", "GERMANY": "DE",
-    "아시아": "ASIA", "ASIA": "ASIA",
-    "기타": "OTHER", "OTHER": "OTHER", "OTHERS": "OTHER",
-    "합계": "TOTAL", "합 계": "TOTAL", "총계": "TOTAL", "TOTAL": "TOTAL",
+    "아시아": "ASIA", "ASIA": "ASIA", "아태": "ASIA", "아시아태평양": "ASIA",
+    "북미": "NA", "북미주": "NA", "NORTHAMERICA": "NA",
+    "중남미": "LATAM", "남미": "LATAM", "LATINAMERICA": "LATAM",
+    "중동": "ME", "MIDDLEEAST": "ME", "중동아프리카": "MEA",
+    "아프리카": "AF", "AFRICA": "AF",
+    "인도": "IN", "INDIA": "IN", "베트남": "VN", "VIETNAM": "VN",
+    "오세아니아": "OCEANIA", "OCEANIA": "OCEANIA",
+    "기타": "OTHER", "기타국가": "OTHER", "기타지역": "OTHER",
+    "OTHER": "OTHER", "OTHERS": "OTHER",
+    "합계": "TOTAL", "합 계": "TOTAL", "총계": "TOTAL", "TOTAL": "TOTAL", "소계": "TOTAL",
 }
+# Regions specific enough to identify a geographic table (excludes the structural
+# OTHER / TOTAL rows, which appear in many non-geographic tables too).
+_SPECIFIC_REGIONS = set(_REGION_CANON.values()) - {"OTHER", "TOTAL"}
 
 
 def _canon_region(s: str) -> str:
@@ -670,15 +681,22 @@ class OpenDartSource(Source):
         return text
 
     @staticmethod
-    def _segment_note(text):
-        """The slice of the report around the 영업부문 (operating-segment) note."""
-        for kw in ("영업부문", "부문정보", "보고부문"):
-            i = text.find(kw)
-            # skip the business-overview mention; the note is late in the doc
-            while i != -1 and i < len(text) * 0.3:
-                i = text.find(kw, i + 1)
-            if i != -1:
-                return text[i:i + 20000]
+    def _note_window(text, is_geo):
+        """Slice of the report holding the relevant 영업부문 note table. The note
+        appears both in the business-overview section and (authoritatively) in the
+        financial-statement notes; the latter comes later, so we anchor on the LAST
+        occurrence of the note phrase. Document layout varies a lot by filer, so a
+        fixed position threshold does not work — phrase anchoring does."""
+        anchors = (["지역별 부문정보", "지역별 매출", "지역에 대한", "지역별"] if is_geo
+                   else ["영업부문에 대한", "부문별 정보", "부문에 대한 정보",
+                         "부문별", "영업부문"])
+        for a in anchors:                 # most specific first
+            i = text.rfind(a)             # notes come after the business overview
+            if i >= 0:
+                # geo tables follow their heading; segment tables often precede the
+                # explanatory footnote we anchor on, so widen the window backwards.
+                lo = i - 200 if is_geo else max(0, i - 14000)
+                return text[lo:i + 25000]
         return ""
 
     @staticmethod
@@ -701,7 +719,7 @@ class OpenDartSource(Source):
 
     def _region_value(self, text, region_canon, col):
         """col in {'discrete','cumulative','current'} -> value in won, or None."""
-        note = self._segment_note(text)
+        note = self._note_window(text, is_geo=True)
         if not note:
             return None
         mult = _unit_multiplier(note)
@@ -716,9 +734,12 @@ class OpenDartSource(Source):
 
         for tbl in _html_tables(note):
             # region-as-rows layout (standard in quarterly reports): a table with
-            # ≥2 rows each labelled by a region name.
+            # ≥2 rows each labelled by a *specific* region (not just Other/Total,
+            # which appear in many non-geographic tables).
             rows_with_region = [r for r in tbl if region_at(r) is not None]
-            if len({_canon_region(r[region_at(r)]) for r in rows_with_region}) < 2:
+            specific = {_canon_region(r[region_at(r)]) for r in rows_with_region
+                        } & _SPECIFIC_REGIONS
+            if len(specific) < 2:
                 continue
             disc_i, cum_i = self._pick_column(tbl)
             for r in rows_with_region:
@@ -736,52 +757,48 @@ class OpenDartSource(Source):
                     idx = 0
                 if idx < len(nums):
                     return nums[idx] * mult
-        return None
-
-    def _segment_value(self, text, seg_label, want, col):
-        """Business-segment (영업부문) revenue/opincome by segment name -> won."""
-        note = self._segment_note(text)
-        if not note:
-            return None
-        mult = _unit_multiplier(note)
-        target = re.sub(r"[\s()\.\-_/]", "", seg_label).upper()
-        rev_kw = ("매출", "수익", "영업수익")
-        oi_kw = ("영업이익", "영업손익", "부문이익", "부문손익")
-        for tbl in _html_tables(note):
-            # find the column whose header names revenue vs operating income
-            header = tbl[0] if tbl else []
-            col_idx = None
-            keys = oi_kw if want == "opincome" else rev_kw
-            for j, h in enumerate(header):
-                if any(k in h for k in keys):
-                    col_idx = j - 1  # minus the label column
-                    break
-            for r in tbl:
-                lab = re.sub(r"[\s()\.\-_/]", "", r[0]).upper()
-                if not lab or target not in lab and lab not in target:
+        # region-as-columns layout (annual reports): regions are header columns and
+        # the values sit in a data row. Only full-year ('current') values appear
+        # here — the current period (당기) table comes first, so the first match wins.
+        if col == "current":
+            for tbl in _html_tables(note):
+                hdr = next((r for r in tbl
+                            if sum(_canon_region(c) in _SPECIFIC_REGIONS
+                                   for c in r) >= 2), None)
+                if not hdr:
                     continue
-                nums = [n for n in (_kr_num(c) for c in r[1:]) if n is not None]
-                if not nums:
+                col_of = {}
+                for j, c in enumerate(hdr):
+                    cc = _canon_region(c)
+                    if cc in known and cc not in col_of:
+                        col_of[cc] = j
+                if region_canon not in col_of:
                     continue
-                idx = col_idx if (col_idx is not None and 0 <= col_idx < len(nums)) else 0
-                return nums[idx] * mult
+                j = col_of[region_canon]
+                for r in tbl:
+                    if r is hdr or j >= len(r):
+                        continue
+                    v = _kr_num(r[j])
+                    if v is not None:
+                        return v * mult
         return None
 
     def segment_quarterly(self, api_id, fye_month, years, label, want, is_geo):
-        """Discrete-quarter {(cal_y, cal_q): value_won} for a Korean segment or
-        geographic label. Q1–Q3 read the 3-month column directly; Q4 = annual −
-        9-month cumulative."""
-        if not self.available:
+        """Discrete-quarter {(cal_y, cal_q): value_won} for a Korean GEOGRAPHIC
+        (지역별) revenue label. Q1–Q3 read the note's 3-month column directly; Q4 =
+        full-year − 9-month cumulative (the annual note is transposed).
+
+        Scope: geographic **revenue** only. Korean filings do not break operating
+        income out by region, and business-*segment* (영업부문) note tables are too
+        filer-variable to parse reliably (label styles, overview-vs-note, transposed
+        layouts differ per company), so those return empty rather than risk a wrong
+        reconciliation."""
+        if not self.available or not is_geo or want == "opincome":
             return {}
         corp = self._corp_map().get(api_id.strip())
         if not corp:
             return {}
-        # Korean 지역별 (geographic) notes disclose revenue by region only —
-        # operating income is not broken out geographically — so a geo op-income
-        # request has no source (return empty rather than mismatching revenue).
-        if is_geo and want == "opincome":
-            return {}
-        region_canon = _canon_region(label) if is_geo else None
+        region_canon = _canon_region(label)
         yrs = sorted(set(int(y) for y in years)) if years else \
             range(2018, datetime.date.today().year + 1)
         out = {}
@@ -792,22 +809,17 @@ class OpenDartSource(Source):
                         rc = self._rcept_for(corp, year, q)
                         if not rc:
                             continue
-                        text = self._dart_document(rc)
-                        v = (self._region_value(text, region_canon, "discrete")
-                             if is_geo else
-                             self._segment_value(text, label, want, "discrete"))
+                        v = self._region_value(self._dart_document(rc),
+                                               region_canon, "discrete")
                     else:  # Q4 = full-year − 9-month cumulative
                         rc4 = self._rcept_for(corp, year, 4)
                         rc3 = self._rcept_for(corp, year, 3)
                         if not rc4 or not rc3:
                             continue
-                        t4, t3 = self._dart_document(rc4), self._dart_document(rc3)
-                        if is_geo:
-                            fy = self._region_value(t4, region_canon, "current")
-                            c3 = self._region_value(t3, region_canon, "cumulative")
-                        else:
-                            fy = self._segment_value(t4, label, want, "current")
-                            c3 = self._segment_value(t3, label, want, "cumulative")
+                        fy = self._region_value(self._dart_document(rc4),
+                                                region_canon, "current")
+                        c3 = self._region_value(self._dart_document(rc3),
+                                                region_canon, "cumulative")
                         v = (fy - c3) if (fy is not None and c3 is not None) else None
                     if v is not None:
                         out[(year, q)] = v
@@ -1433,6 +1445,13 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
                         rec["note"] = (f"map '{label}' in config/segment_members.csv "
                                        "(JP: a substring of the EDINET member local-name)")
                         results.append(rec); continue
+                    elif market == "kr" and not is_geo:
+                        # KR support is geographic revenue only (business-segment
+                        # note tables are too filer-variable to parse reliably).
+                        rec["status"] = "UNSUPPORTED_SEGMENT"
+                        rec["note"] = ("KR business-segment not reconciled (geographic "
+                                       "revenue only); many KR filers are single-segment")
+                        results.append(rec); continue
 
                     try:
                         if market == "us":
@@ -1447,9 +1466,8 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
                                 comp["api_id"], comp["fye_month"],
                                 years_by_company.get(cid), member, want)
                         elif market == "kr":
-                            # KR: geo matched by region name, segment by label
-                            # (segment_members.csv can override the label to match
-                            # the Korean note's row name).
+                            # KR geographic revenue: matched by region name (a
+                            # segment_members.csv override can rename the label).
                             ser = sources["kr"].segment_quarterly(
                                 comp["api_id"], comp["fye_month"],
                                 years_by_company.get(cid), member or label, want, is_geo)

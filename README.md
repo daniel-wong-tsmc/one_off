@@ -8,7 +8,7 @@ does not match**.
 | Market | Source | Key needed | Coverage | Segment/geo |
 |--------|--------|-----------|----------|-------------|
 | 🇺🇸 US | SEC EDGAR | none (User-Agent only) | quarterly, full history | ✅ EDGAR dimensional XBRL |
-| 🇰🇷 Korea | OpenDART | `DART_KEY` (free) | quarterly, full history | 🟡 geographic revenue (Q1–Q3) from the DART note tables |
+| 🇰🇷 Korea | OpenDART | `DART_KEY` (free) | quarterly, full history | 🟡 geographic revenue (all four quarters) from the DART note tables |
 | 🇹🇼 Taiwan | FinMind | `FINMIND_TOKEN` optional | quarterly, full history | ⛔ footnote-only (MOPS TIFRS PDF), no free API |
 | 🇯🇵 Japan | J-Quants V2 + EDINET | `JQUANTS_KEY`, `EDINET_KEY` (free) | quarterly recent ~2yr (J-Quants) + pre-2024 quarterly & annual (EDINET 四半期/有価証券報告書) | ✅ EDINET dimensional XBRL |
 
@@ -144,19 +144,22 @@ Outputs:
     (Game/Music segment revenue and operating income, discrete quarters summing
     to the annual). *Caveats:* single-segment filers and post-April-2024 periods
     (no more 四半期 reports) yield little/no structured segment data.
-  - **Korea (OpenDART notes).** KR segment/geo lives in the financial-statement
-    notes, not the primary statements — so the tool downloads the full periodic
-    report (`document.xml`), finds the 영업부문 note, and parses its HTML tables.
-    **Geographic revenue** (지역별 매출) is reconciled for **Q1–Q3** by reading the
-    note's discrete 3-month (3개월) column, with the reported unit (백만원/천원)
-    handled and region names mapped (中/한국/미국/… ↔ China/Korea/US/…). Verified on
-    DB HiTek (China/Korea/US/Japan quarterly geographic revenue). *Limitations:*
-    (a) geographic **operating income** isn't broken out by region in KR filings →
-    `MISSING_IN_API`; (b) **Q4** needs the annual report, whose note uses a
-    different (transposed, fragmented) table layout that isn't parsed yet →
-    `MISSING_IN_API`; (c) **business-segment** splits are read for multi-segment
-    filers where a 부문별 table exists (single-segment filers → `MISSING_IN_API`);
-    map an English label to the Korean row name in `segment_members.csv` if needed.
+  - **Korea (OpenDART notes).** KR geographic revenue lives in the
+    financial-statement notes, not the primary statements — so the tool downloads
+    the full periodic report (`document.xml`), finds the 영업부문 note (anchored on
+    the note phrase, not a fixed position), and parses its HTML tables (`<TH>`/
+    `<TD>`/`<TE>` cells). **Geographic revenue** (지역별 매출) is reconciled for **all
+    four quarters**: Q1–Q3 read the note's discrete 3-month (3개월) column, and Q4 =
+    annual − 9-month cumulative (the annual note uses a transposed, regions-as-
+    columns layout, handled separately). The reported unit (백만원/천원) is applied
+    and region names are mapped both country-level and continent-level
+    (중국/China, 한국/Korea, 미국/US, 북미/NorthAmerica, 유럽/Europe, 중남미/LatAm, …).
+    Verified on DB HiTek: China/Korea/US/Japan quarterly geographic revenue,
+    including the Q4 derivation. *Scope:* geographic **operating income** isn't
+    broken out by region in KR filings → `MISSING_IN_API`; **business-segment**
+    (영업부문) splits are **not** reconciled (`UNSUPPORTED_SEGMENT`) — those note
+    tables are too filer-variable to parse reliably, and most KR filers here are
+    single-segment anyway.
   - **Taiwan.** Segment/geographic data is **footnote-only** (TIFRS 附註, PDF/HTML
     on MOPS) and exposed by **no free API** — FinMind and the TWSE OpenAPI stop at
     the primary statements. Those rows return `SEGMENT_SOURCE_UNAVAILABLE`.
