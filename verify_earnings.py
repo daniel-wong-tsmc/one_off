@@ -787,6 +787,46 @@ def load_metric_map(path: Path) -> dict:
     return mm
 
 
+def load_company_mapping(path: Path) -> dict:
+    """The user's `company_id_mapping` file: `company_id;external_mapped_name`
+    (delimiter `;`, like the other data files). Returns {company_id -> name}.
+    Header row optional — if the first row isn't a real mapping it's skipped.
+    This does NOT resolve a company to its market/API id (a human name can't be
+    turned into a KRX/TWSE/sec code reliably); it only supplies display names
+    and lets us flag which mapped ids are still missing from the registry."""
+    mp = {}
+    if not path.exists():
+        return mp
+    text = path.read_text(encoding="utf-8-sig")
+    # the user's data files are ';'-delimited, but tolerate a comma file too:
+    # pick whichever delimiter actually appears on a real (non-comment) line.
+    delim = ";"
+    for line in text.splitlines():
+        if line.strip() and not line.lstrip().startswith("#"):
+            if ";" not in line and "," in line:
+                delim = ","
+            break
+    for parts in csv.reader(io.StringIO(text), delimiter=delim):
+        if not parts or not (parts[0] or "").strip():
+            continue
+        cid = parts[0].strip()
+        # skip a header row and comment lines
+        if cid.startswith("#") or cid.lower() == "company_id":
+            continue
+        name = parts[1].strip() if len(parts) > 1 else ""
+        mp[cid] = name
+    return mp
+
+
+def find_mapping_file(data_dir: Path, name: str) -> Path:
+    """Locate the mapping file, tolerating a `.csv` suffix or its absence
+    (the user's file is literally named `company_id_mapping`)."""
+    for cand in (data_dir / name, data_dir / (name + ".csv")):
+        if cand.exists():
+            return cand
+    return data_dir / name
+
+
 # --------------------------------------------------------------------------- #
 # Verifier
 # --------------------------------------------------------------------------- #
@@ -807,13 +847,16 @@ def compare(file_val, api_local, per_share):
 
 
 def run(data_dir: Path, out_dir: Path, compare_col: str,
-        registry: dict, metric_map: dict, files_map: dict, seg_members: dict = None):
+        registry: dict, metric_map: dict, files_map: dict, seg_members: dict = None,
+        mapping: dict = None):
     sources = {s.market: s for s in
                (EdgarSource(), OpenDartSource(), FinMindSource(), JapanSource())}
     edgar_dim = EdgarDimensional(sources["us"])
     seg_members = seg_members or {}
+    mapping = mapping or {}
     out_dir.mkdir(parents=True, exist_ok=True)
     results = []
+    unconfigured = {}   # company_id -> mapped name, for the end-of-run to-do list
 
     # pre-scan: which calendar years does each company appear in? (lets per-year
     # sources like OpenDART fetch only what's needed instead of all history)
@@ -859,13 +902,17 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
                        "api_value_local": "", "api_value_millions": "",
                        "status": "", "note": ""}
                 comp = registry.get(cid)
-                cname = comp["name"] if comp else ""
+                cname = (comp["name"] if comp else "") or mapping.get(cid, "")
                 rec["company_name"] = cname
+                if not comp and cid:
+                    unconfigured[cid] = mapping.get(cid, "")
 
                 if is_seg:
                     if not comp:
                         rec["status"] = "COMPANY_NOT_CONFIGURED"
-                        rec["note"] = "add to config/company_registry.csv"
+                        rec["note"] = ("add to config/company_registry.csv"
+                                       + (f" (mapped name: {mapping[cid]})"
+                                          if mapping.get(cid) else ""))
                         results.append(rec); continue
                     if comp["market"] != "us":
                         rec["status"] = "UNSUPPORTED_SEGMENT"
@@ -910,7 +957,9 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
                     results.append(rec); continue
                 if not comp:
                     rec["status"] = "COMPANY_NOT_CONFIGURED"
-                    rec["note"] = "add to config/company_registry.csv"
+                    rec["note"] = ("add to config/company_registry.csv"
+                                   + (f" (mapped name: {mapping[cid]})"
+                                      if mapping.get(cid) else ""))
                     results.append(rec); continue
                 canonical = metric_map.get(code)
                 if not canonical:
@@ -979,6 +1028,12 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
             print(f"  [{r['company_id']} {r['company_name']}] {r['financial_code']} "
                   f"{r['calendar_year']}Q{r['calendar_quarter']}: "
                   f"file={r['file_value']} vs api(millions)={r['api_value_millions']}")
+    if unconfigured:
+        print(f"\n=== COMPANIES TO CONFIGURE ({len(unconfigured)}) ===")
+        print("  (present in your data but missing from config/company_registry.csv)")
+        for cid in sorted(unconfigured):
+            nm = unconfigured[cid]
+            print(f"  company_id={cid}" + (f"  ->  {nm}" if nm else "  (no mapped name)"))
     return results
 
 
@@ -1003,6 +1058,10 @@ def main():
     ap.add_argument("--compare-column", default="financial_report_value",
                     choices=["financial_report_value", "financial_value"],
                     help="which file column to reconcile against the API")
+    ap.add_argument("--mapping-file", default="company_id_mapping",
+                    help="your company_id -> name file (in --data-dir); a "
+                         "'.csv' suffix is tolerated. Supplies display names and "
+                         "flags ids missing from company_registry.csv")
     ap.add_argument("--self-test", action="store_true",
                     help="run live against the 4 validated companies in sample_data/")
     args = ap.parse_args()
@@ -1016,10 +1075,11 @@ def main():
     seg_members = load_segment_members(Path(args.config_dir) / "segment_members.csv")
     if args.self_test:
         seg_members = load_segment_members(cfg / "segment_members.csv") or seg_members
+    mapping = load_company_mapping(find_mapping_file(Path(args.data_dir), args.mapping_file))
     if not registry:
         print("WARNING: empty company_registry.csv — every row will be COMPANY_NOT_CONFIGURED")
     run(Path(args.data_dir), Path(args.out_dir), args.compare_column,
-        registry, metric_map, DEFAULT_FILES, seg_members)
+        registry, metric_map, DEFAULT_FILES, seg_members, mapping)
 
 
 if __name__ == "__main__":

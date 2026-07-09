@@ -32,6 +32,15 @@ Two small CSVs under `config/` drive everything:
   `REVENUE`, `ACCOUNTS_PAYABLE`) to a canonical metric. Codes not listed here are
   reported as `NO_MAPPING` rather than silently skipped.
 
+Your **`company_id_mapping`** file (`company_id;external_mapped_name`) is picked
+up automatically from `--data-dir` (a `.csv` suffix is optional; override the
+name with `--mapping-file`). It supplies human-readable company names to the
+output and, at the end of a run, prints a **"COMPANIES TO CONFIGURE"** to-do
+list of every `company_id` that appears in your data but is still missing from
+`company_registry.csv`. It does *not* resolve a company to its market/API id —
+a name can't be turned into a KRX/TWSE/sec code reliably, so you still fill in
+`market` and `api_id` yourself.
+
 ## Run
 
 ```bash

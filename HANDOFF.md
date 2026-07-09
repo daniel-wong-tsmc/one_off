@@ -90,10 +90,13 @@ period semantics against actual values.
 
 1. **Calibrate against the user's real data** — units, compare column, quarter
    semantics. Nothing has run on the actual files.
-2. **Wire `company_id_mapping`** — currently ignored; the user still hand-fills
-   `company_registry.csv` with market+api_id (a name can't be auto-resolved to a
-   KRX/TWSE/sec code reliably, but the mapping could at least populate names and
-   flag unconfigured ids).
+2. ~~**Wire `company_id_mapping`**~~ **DONE.** `load_company_mapping()` +
+   `find_mapping_file()` auto-load `<data-dir>/company_id_mapping` (`.csv`
+   suffix optional; `--mapping-file` to override). It fills `company_name` in
+   the output and prints a **"COMPANIES TO CONFIGURE"** to-do list of ids seen
+   in the data but absent from `company_registry.csv` (with mapped names). It
+   still does NOT resolve name → market/api_id (unreliable); the user fills
+   those. Validated on synthetic data; not yet seen against the real mapping.
 3. **Japan segment/geo** — hard: much is XBRL **text-block prose** (Socionext's
    geographic revenue is a text block; it's single-segment with no business
    split). Expect partial results.
