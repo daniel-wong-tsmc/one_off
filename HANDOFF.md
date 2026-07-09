@@ -12,7 +12,7 @@ does not match**. (China was explicitly dropped from scope.)
 - Main program: `verify_earnings.py` (single file, stdlib + `requests`).
 - Background research: `earnings-api-research.md`.
 - User guide + assumptions + limitations: `README.md` (read this too).
-- Branch: `claude/earnings-api-research-kwe3km`. All work is committed & pushed.
+- Branch: `claude/earnings-api-research-kwe3km-gp1m3p`. All work is committed & pushed.
 
 ## Run it
 
@@ -48,7 +48,7 @@ only `financial_value` (no `financial_report_value`).
 - Sources (each exposes `quarterly(api_id, metric, fye_month, years) -> {(cal_y,cal_q): value_local}`):
   - `EdgarSource` (US) — `companyconcept` XBRL; discrete quarters (~90d frames), Q4 = FY − (Q1+Q2+Q3); balance sheet via instant facts.
   - `EdgarDimensional` (US segment/geo) — parses filing **XBRL instances** (`*_htm.xml`) for dimensional facts on `StatementBusinessSegmentsAxis` / `StatementGeographicalAxis`. Handles the `ConsolidationItemsAxis=OperatingSegmentsMember` qualifier. Quarterly from 10-Qs (~90d).
-  - `OpenDartSource` (KR) — `fnlttSinglAcntAll`; interim `thstrm_amount` auto-detected discrete-vs-cumulative; balance sheet. Downloads `corpCode.xml` once (~3.5 MB, slow).
+  - `OpenDartSource` (KR) — statements via `fnlttSinglAcntAll` (interim `thstrm_amount` auto-detected discrete-vs-cumulative; balance sheet; downloads `corpCode.xml` once, ~3.5 MB). **Segment/geo:** `segment_quarterly` downloads the full periodic report (`document.xml`, DS001), locates the note via `_note_windows`, and parses HTML tables — `_region_value` (지역별 geographic) and `_segment_revenue` (보고부문 business segment).
   - `FinMindSource` (TW) — `TaiwanStockFinancialStatements` (discrete quarters) + `TaiwanStockBalanceSheet`. Equity field is `Equity`.
   - `EdinetSource` (JP) — discovers annual (docType 120) + quarterly (140) reports by scanning statutory filing windows (cached per date; **slow first run per company**), reads YTD `*Duration` values and **de-cumulates**; balance sheet via `*Instant`. **EPS excluded** (YTD EPS is restated across stock splits → differencing invalid).
   - `JQuantsSource` (JP) — V2 `/fins/summary` (TDnet 決算短信); YTD values de-cumulated; free plan = rolling ~2yr + ~12-week delay.
@@ -65,10 +65,12 @@ only `financial_value` (no `financial_report_value`).
 
 - `config/company_registry.csv` — `company_id → market, api_id, fye_month, name`. **Required.** api_id = ticker/CIK (us), KRX code (kr), TWSE code (tw), sec code (jp).
 - `config/metric_map.csv` — `financial_code → canonical_metric`. Only common codes seeded; unmapped → `NO_MAPPING`.
-- `config/segment_members.csv` — `(company_id, label) → XBRL member`. US: exact
+- `config/segment_members.csv` — `(company_id, label) → member`. US: exact XBRL
   member local-name for business segments / custom regions (country geo is
   built-in via `GEO_MEMBER`). JP: a **substring** of the EDINET member local-name
-  (e.g. `GameAndNetworkServices`).
+  (e.g. `GameAndNetworkServices`). KR: the 부문 name in the reportable-segment note
+  for BUSINESS segments (e.g. `DS`); KR geographic needs no mapping (region names
+  are auto-matched, country- and continent-level).
 
 ## Verified working (self-test, live)
 
@@ -106,7 +108,7 @@ core assumptions checked out:
    Qorvo's history into the wrong calendar quarter. Fix validated on real Qorvo
    revenue/pretax dates; self-test unchanged.
 
-### New this round
+### Metric coverage & de-cumulation (from the calibration round)
 - **Metric taxonomy.** Real `FA.csv` is dominated by **derived** codes (margins,
   turnover days, cash-conversion cycle, `*_QOQ`/`*_YOY` deltas). These are now
   categorized `UNSUPPORTED_DERIVED` (can't reconcile a computed ratio against one
@@ -139,25 +141,28 @@ core assumptions checked out:
    `segment_members.csv` (JP member = a substring of the XBRL member local-name).
    Caveat: single-segment filers (Socionext) and post-Apr-2024 periods (no more
    四半期 reports) have little/no structured segment data → partial coverage.
-4. **Korea segment/geo** — **DONE for geographic revenue (all four quarters).**
-   `OpenDartSource.segment_quarterly` downloads the full periodic report
-   (`document.xml`, DS001), finds the 영업부문 note by phrase-anchoring on the LAST
-   occurrence of the note phrase (a fixed position threshold fails — DB HiTek's
-   note is at ~39% of the doc, LG Electronics' at ~20%), and parses its HTML
-   tables (`<TH>`/`<TD>`/`<TE>` cells), unit-aware (백만원/천원), with country- and
-   continent-level region canonicalization. Q1–Q3 read the discrete 3개월 column;
-   **Q4 = annual − 9-month cumulative**, where the annual (사업보고서) note uses a
-   **transposed** regions-as-columns layout (handled). Validated on DB HiTek:
-   China 2023 Q1–Q4 (162,798 / 169,257 / 167,085 / 166,475 백만원) all exact.
-   **Business-segment revenue** also works: `_segment_revenue` reads the
-   reportable-segment (보고부문) note — the discrete 당분기(3개월) table for Q1–Q3 and
-   annual − 9-month for Q4 — with unit handling and label→부문 mapping via
-   `segment_members.csv`. `_note_windows` tries every anchor occurrence in document
-   order so the CONSOLIDATED (연결) note is preferred over the separate (별도) one,
-   and the annual (single 당기 table, no 3개월/누적 split) is handled. Validated on
-   Samsung (DX/DS/SDC/Harman): discrete quarters sum exactly to the 9-month figure,
-   and FY2023 DS = ₩66.59 tn matches the filing. **Skipped by request:** segment &
-   geographic **operating income** (not consistently disclosed) → MISSING.
+4. **Korea segment/geo** — **DONE for geographic AND business-segment revenue (all
+   four quarters).** `OpenDartSource.segment_quarterly` downloads the full periodic
+   report (`document.xml`, DS001) and parses HTML note tables (`<TH>`/`<TD>`/`<TE>`
+   cells; unit-aware 백만원/천원/억원). Note location is via `_note_windows`, which
+   yields a window around EVERY anchor occurrence and the caller tries each in turn
+   — ordered most-specific-anchor first, then DOCUMENT order, so the CONSOLIDATED
+   (연결) note is preferred over the separate (별도) one. (A fixed position threshold
+   failed — DB HiTek's note is at ~39% of the doc, LG Electronics' at ~20%.)
+   - **Geographic** (`_region_value`): Q1–Q3 read the discrete 3개월 column; Q4 =
+     annual − 9-month, where the annual (사업보고서) note is **transposed**
+     (regions-as-columns). Country- and continent-level region canonicalization.
+     Validated on DB HiTek: China 2023 Q1–Q4 (162,798 / 169,257 / 167,085 /
+     166,475 백만원) all exact.
+   - **Business segment** (`_segment_revenue`): reads the reportable-segment
+     (보고부문) note — discrete 당분기(3개월) table for Q1–Q3, annual − 9-month for Q4;
+     handles transposed (segments-as-columns, 매출액 row) and segments-as-rows;
+     label→부문 mapping via `segment_members.csv`. Validated on Samsung
+     (DX/DS/SDC/Harman): discrete quarters sum exactly to the 9-month figure, and
+     FY2023 DS = ₩66.59 tn matches the filing. Single-segment filers correctly
+     return nothing (no false match).
+   - **Skipped by request:** segment & geographic **operating income** (not
+     consistently disclosed) → MISSING.
 5. **Taiwan segment/geo** — **not available via any free API** (probed concretely,
    not just researched):
    - TWSE OpenAPI `t187ap06_*` and FinMind `TaiwanStockFinancialStatements` are
@@ -192,3 +197,15 @@ core assumptions checked out:
 - EDGAR revenue tag varies: try `Revenues`,
   `RevenueFromContractWithCustomerExcludingAssessedTax`, etc.
 - J-Quants free window **rolls forward** — cache older quarters sooner.
+- The `segment_code` period prefix is **unreliable** (e.g. Amazon `2020Q3_AWS`
+  row with calendar cols 2025 Q3) — always use the `calendar_year`/`calendar_quarter`
+  columns for the period; the prefix is only stripped to get the label.
+- KR note parsing (`document.xml`): DART markup uses `<TH>`/`<TD>` **and `<TE>`**
+  body cells; units are per-note (`백만원`/`천원`/`억원` — overview tables often 억원,
+  notes 백만원); the segment note appears in both the **연결 (consolidated)** and
+  **별도 (separate)** statements — prefer consolidated (comes first in doc order);
+  quarterly notes give 당분기(3개월)+누적, annual notes a single 당기 table
+  (sometimes transposed with the dimension across the header).
+- A single phrase anchor is fragile (the phrase recurs in overview + both note
+  sections); `_note_windows` returns all occurrences and the caller tries each —
+  reuse this pattern for any new footnote-parsing source (e.g. Taiwan).
