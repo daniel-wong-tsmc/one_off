@@ -21,7 +21,8 @@ See README.md for the assumptions this makes about your files (units, which
 value column is compared, quarter semantics).
 """
 from __future__ import annotations
-import argparse, csv, io, json, os, sys, time, zipfile, datetime, urllib.parse
+import argparse, csv, io, json, os, re, sys, time, zipfile, datetime, urllib.parse
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 try:
@@ -200,6 +201,125 @@ class EdgarSource(Source):
             if len(sub) == 3:
                 out[cal_key_from_date(e_annual.isoformat())] = ann_val - sum(sub)
         return out
+
+
+# ---- US segment/geo: EDGAR dimensional XBRL (pilot) ----------------------- #
+# Built-in geographic label -> XBRL member local-name. Country members are the
+# ISO-2 code (country:CN -> "CN"); regions vary by filer, add via config.
+GEO_MEMBER = {
+    "CHINA": "CN", "US": "US", "USA": "US", "UNITED STATES": "US",
+    "UNITED STATES OF AMERICA": "US", "TAIWAN": "TW", "JAPAN": "JP",
+    "KOREA": "KR", "SOUTH KOREA": "KR", "GERMANY": "DE", "EUROPE": "EuropeMember",
+}
+
+
+def _xloc(q):
+    return q.split("}")[-1].split(":")[-1]
+
+
+class EdgarDimensional:
+    """Extract dimensional (segment / geographic) facts from EDGAR filing XBRL
+    instances. Pilot: US only."""
+    REV_TAGS = ("Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
+                "RevenueFromContractWithCustomerIncludingAssessedTax")
+    OPINC_TAGS = ("OperatingIncomeLoss",)
+
+    def __init__(self, edgar: "EdgarSource"):
+        self.edgar = edgar
+
+    def _filings(self, cik, years):
+        d = _http_json(f"https://data.sec.gov/submissions/CIK{cik}.json",
+                       headers={"User-Agent": SEC_UA}, cache_key=f"edgar_sub_{cik}")
+        r = (d or {}).get("filings", {}).get("recent", {})
+        out = set()
+        yrs = set(int(y) for y in years) if years else None
+        for form, acc, rd, doc in zip(r.get("form", []), r.get("accessionNumber", []),
+                                      r.get("reportDate", []), r.get("primaryDocument", [])):
+            if form not in ("10-K", "10-Q") or not doc.endswith(".htm"):
+                continue
+            try:
+                y = int(rd[:4])
+            except ValueError:
+                continue
+            if yrs and y not in yrs and (y - 1) not in yrs:
+                continue
+            out.add((acc, doc))
+        return out
+
+    def _facts(self, cik, acc, doc):
+        ck = f"edgar_dim_{acc}"
+        c = _cache_get(ck)
+        if c is not None:
+            return c
+        inst = doc[:-4] + "_htm.xml"
+        url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc.replace('-', '')}/{inst}"
+        facts = []
+        try:
+            r = SESSION.get(url, headers={"User-Agent": SEC_UA}, timeout=90)
+            r.raise_for_status()
+            root = ET.fromstring(r.content)
+            ctx = {}
+            for cc in root:
+                if _xloc(cc.tag) != "context":
+                    continue
+                dims = {}
+                s = e = None
+                for x in cc.iter():
+                    l = _xloc(x.tag)
+                    if l == "explicitMember":
+                        dims[_xloc(x.get("dimension"))] = _xloc((x.text or "").strip())
+                    elif l == "startDate":
+                        s = x.text
+                    elif l == "endDate":
+                        e = x.text
+                ctx[cc.get("id")] = (s, e, dims)
+            for el in root.iter():
+                cr = el.get("contextRef")
+                if not cr or cr not in ctx:
+                    continue
+                s, e, dims = ctx[cr]
+                if len(dims) != 1 or not s or not e:   # single-axis breakdowns only
+                    continue
+                ax = next(iter(dims))
+                if "Segment" not in ax and "Geograph" not in ax:
+                    continue
+                try:
+                    val = float(el.text)
+                except (TypeError, ValueError):
+                    continue
+                facts.append([_xloc(el.tag), s, e, ax, dims[ax], val])
+        except Exception:
+            pass
+        _cache_put(ck, facts)
+        return facts
+
+    def series(self, cik, tags, axis_kw, member, years):
+        """Discrete-quarter (~90d) dimensional values keyed by (cal_year, cal_q)."""
+        out = {}
+        for acc, doc in self._filings(cik, years):
+            for tag, s, e, ax, mem, val in self._facts(cik, acc, doc):
+                if tag not in tags or axis_kw not in ax or mem != member:
+                    continue
+                days = (datetime.date.fromisoformat(e) - datetime.date.fromisoformat(s)).days
+                if 85 <= days <= 95:
+                    out[cal_key_from_date(e)] = val
+        return out
+
+
+def load_segment_members(path: Path) -> dict:
+    """(company_id, label_upper) -> XBRL member local-name (business segments and
+    any custom/region geographic members)."""
+    mm = {}
+    if not path.exists():
+        return mm
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            cid = (row.get("company_id") or "").strip()
+            label = (row.get("label") or "").strip()
+            member = (row.get("member") or "").strip()
+            if cid and label and member and not cid.startswith("#"):
+                mm[(cid, label.upper())] = member
+    return mm
 
 
 # ---- Korea: OpenDART ------------------------------------------------------ #
@@ -675,9 +795,11 @@ def compare(file_val, api_local, per_share):
 
 
 def run(data_dir: Path, out_dir: Path, compare_col: str,
-        registry: dict, metric_map: dict, files_map: dict):
+        registry: dict, metric_map: dict, files_map: dict, seg_members: dict = None):
     sources = {s.market: s for s in
                (EdgarSource(), OpenDartSource(), FinMindSource(), JapanSource())}
+    edgar_dim = EdgarDimensional(sources["us"])
+    seg_members = seg_members or {}
     out_dir.mkdir(parents=True, exist_ok=True)
     results = []
 
@@ -729,8 +851,50 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
                 rec["company_name"] = cname
 
                 if is_seg:
-                    rec["status"] = "UNSUPPORTED_SEGMENT"
-                    rec["note"] = "segment/geo not auto-verified in v1 (see README)"
+                    if not comp:
+                        rec["status"] = "COMPANY_NOT_CONFIGURED"
+                        rec["note"] = "add to config/company_registry.csv"
+                        results.append(rec); continue
+                    if comp["market"] != "us":
+                        rec["status"] = "UNSUPPORTED_SEGMENT"
+                        rec["note"] = "segment/geo pilot is US-only for now (see README)"
+                        results.append(rec); continue
+                    label = re.sub(r"^\d{4}Q\d_", "", rec["segment_code"]).strip()
+                    is_geo = logical.startswith("Seg_Geo")
+                    axis_kw = "Geograph" if is_geo else "Segment"
+                    tags = (EdgarDimensional.OPINC_TAGS
+                            if logical.endswith("Operating_Income")
+                            else EdgarDimensional.REV_TAGS)
+                    member = seg_members.get((cid, label.upper()))
+                    if not member and is_geo:
+                        member = GEO_MEMBER.get(label.upper())
+                    if not member:
+                        rec["status"] = "NO_SEGMENT_MAPPING"
+                        rec["note"] = f"map '{label}' in config/segment_members.csv"
+                        results.append(rec); continue
+                    fv_raw = (rec["file_value"] or row.get("financial_value", "")
+                              or row.get("financial_report_value", ""))
+                    try:
+                        fv = float(str(fv_raw).replace(",", ""))
+                    except ValueError:
+                        rec["status"] = "BAD_FILE_VALUE"; results.append(rec); continue
+                    try:
+                        cik = sources["us"]._resolve_cik(comp["api_id"])
+                        ser = edgar_dim.series(cik, tags, axis_kw, member,
+                                               years_by_company.get(cid))
+                        api_local = ser.get((int(cy), int(cq)))
+                        if api_local is None:
+                            rec["status"] = "MISSING_IN_API"
+                            rec["note"] = ("no discrete-quarter dimensional fact "
+                                           "(annual-only disclosure or period absent)")
+                            results.append(rec); continue
+                        status, api_m = compare(fv, api_local, False)
+                        rec["file_value"] = fv
+                        rec["api_value_local"] = api_local
+                        rec["api_value_millions"] = round(api_m, 3)
+                        rec["status"] = status
+                    except Exception as e:
+                        rec["status"] = "ERROR"; rec["note"] = str(e)[:120]
                     results.append(rec); continue
                 if not comp:
                     rec["status"] = "COMPANY_NOT_CONFIGURED"
@@ -837,10 +1001,13 @@ def main():
         cfg = Path("sample_data")
     registry = load_registry(cfg / "company_registry.csv")
     metric_map = load_metric_map(Path(args.config_dir) / "metric_map.csv")
+    seg_members = load_segment_members(Path(args.config_dir) / "segment_members.csv")
+    if args.self_test:
+        seg_members = load_segment_members(cfg / "segment_members.csv") or seg_members
     if not registry:
         print("WARNING: empty company_registry.csv — every row will be COMPANY_NOT_CONFIGURED")
     run(Path(args.data_dir), Path(args.out_dir), args.compare_column,
-        registry, metric_map, DEFAULT_FILES)
+        registry, metric_map, DEFAULT_FILES, seg_members)
 
 
 if __name__ == "__main__":

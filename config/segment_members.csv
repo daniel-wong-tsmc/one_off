@@ -1,0 +1,12 @@
+company_id,label,member
+# Maps a company-defined segment/geographic label (from your segment_code, after
+# stripping the leading period prefix like "2020Q1_") to the XBRL member local
+# name in that filer's EDGAR reports. Needed for BUSINESS SEGMENTS and for
+# geographic regions not covered by the built-in country map (China->CN, US->US,
+# Taiwan->TW, Japan->JP, Korea->KR, Europe->EuropeMember).
+#
+# Find members by inspecting the filing, e.g. Qorvo's segments/regions:
+# 101,HPA,HPAMember
+# 101,CSG,CSGMember
+# 101,ACG,ACGMember
+# 101,Other Asia,OtherAsiaMember

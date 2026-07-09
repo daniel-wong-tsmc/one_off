@@ -77,7 +77,8 @@ Outputs:
 | `NO_MAPPING` | `financial_code` not in `metric_map.csv` |
 | `COMPANY_NOT_CONFIGURED` | `company_id` not in `company_registry.csv` |
 | `UNSUPPORTED_METRIC` | that market's source doesn't expose that metric |
-| `UNSUPPORTED_SEGMENT` | segment/geo file — not auto-verified in v1 |
+| `UNSUPPORTED_SEGMENT` | segment/geo row for a non-US company (pilot is US-only) |
+| `NO_SEGMENT_MAPPING` | US segment/geo label not resolvable — add to `segment_members.csv` |
 | `SOURCE_UNAVAILABLE` | key missing for that market |
 | `BAD_FILE_VALUE` / `ERROR` | unparseable value / fetch error |
 
@@ -100,12 +101,21 @@ Outputs:
   - Any period neither source can reach (older than the J-Quants window *and*
     with no EDINET filing) returns `MISSING_IN_API`. Because the J-Quants free
     window rolls forward, cache older quarters sooner rather than later.
-- **Segment & geographic files are not auto-verified.** Business-segment and
-  geographic splits live in filing *footnotes*, not clean numeric API fields
-  (in Socionext's report, geographic revenue sits inside a text block, and it's
-  a single-segment filer with no business-segment split at all). These rows are
-  flagged `UNSUPPORTED_SEGMENT`. Feasible follow-ups: US dimensional-XBRL
-  segments via EDGAR, and Japan note-text parsing.
+- **Segment & geographic files — US pilot only.** The `Seg_*` files hold
+  business-segment and geographic splits, which live in filing footnotes rather
+  than clean top-line API fields.
+  - **US (EDGAR) is implemented**: segment/geo values are read as *dimensional*
+    XBRL facts from the filing instances (`Revenues` / `OperatingIncomeLoss` on
+    `StatementBusinessSegmentsAxis` / `StatementGeographicalAxis`), at discrete
+    quarterly granularity from 10-Qs. Geographic *country* labels resolve via a
+    built-in map (China→CN, US→US, Taiwan→TW, …); business segments and custom
+    regions are mapped per company in `config/segment_members.csv`. Verified on
+    Qorvo (US/China/Taiwan revenue). Geographic *operating income* is usually
+    not disclosed, so those rows typically come back `MISSING_IN_API`.
+  - **Japan / Korea / Taiwan segment/geo are not yet built** — those rows return
+    `UNSUPPORTED_SEGMENT`. In Japan much of this sits in XBRL text blocks
+    (Socionext's geographic revenue is prose, and it's single-segment); KR/TW
+    need note parsing.
 - **Metric coverage** starts with revenue, operating income, net income, EPS,
   and a few balance-sheet items. Extend `metric_map.csv` (and the per-market
   field maps in the source classes) to cover more `financial_code`s.

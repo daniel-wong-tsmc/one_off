@@ -1,0 +1,4 @@
+company_id;calendar_year;calendar_quarter;segment_code;financial_code;financial_value;financial_report_value
+101;2025;4;2025Q4_US;GEO_REVENUE;664.627;664.627
+101;2025;4;2025Q4_China;GEO_REVENUE;120.872;120.872
+101;2025;4;2025Q4_Taiwan;GEO_REVENUE;86.337;86.337
