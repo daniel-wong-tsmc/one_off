@@ -8,8 +8,8 @@ does not match**.
 | Market | Source | Key needed | Coverage | Segment/geo |
 |--------|--------|-----------|----------|-------------|
 | 🇺🇸 US | SEC EDGAR | none (User-Agent only) | quarterly, full history | ✅ EDGAR dimensional XBRL |
-| 🇰🇷 Korea | OpenDART | `DART_KEY` (free) | quarterly, full history | ⛔ footnote-only, no free API |
-| 🇹🇼 Taiwan | FinMind | `FINMIND_TOKEN` optional | quarterly, full history | ⛔ footnote-only, no free API |
+| 🇰🇷 Korea | OpenDART | `DART_KEY` (free) | quarterly, full history | 🟡 geographic revenue (Q1–Q3) from the DART note tables |
+| 🇹🇼 Taiwan | FinMind | `FINMIND_TOKEN` optional | quarterly, full history | ⛔ footnote-only (MOPS TIFRS PDF), no free API |
 | 🇯🇵 Japan | J-Quants V2 + EDINET | `JQUANTS_KEY`, `EDINET_KEY` (free) | quarterly recent ~2yr (J-Quants) + pre-2024 quarterly & annual (EDINET 四半期/有価証券報告書) | ✅ EDINET dimensional XBRL |
 
 ## Setup
@@ -96,7 +96,7 @@ Outputs:
 | `UNSUPPORTED_DERIVED` | computed ratio / turnover-days / QoQ-delta metric (e.g. `NET_MARGIN`, `CASH_CONVERSION_CYCLE`, `*_QOQ`) — not a single as-filed line item, so not reconcilable against one API field |
 | `COMPANY_NOT_CONFIGURED` | `company_id` not in `company_registry.csv` |
 | `UNSUPPORTED_METRIC` | that market's source doesn't expose that metric |
-| `SEGMENT_SOURCE_UNAVAILABLE` | segment/geo row for **Korea or Taiwan** — that data is footnote-only and not in any free API |
+| `SEGMENT_SOURCE_UNAVAILABLE` | segment/geo row for **Taiwan** — that data is footnote-only (MOPS TIFRS PDF) and not in any free API |
 | `NO_SEGMENT_MAPPING` | US/JP segment/geo label not resolvable — add to `segment_members.csv` |
 | `SOURCE_UNAVAILABLE` | key missing for that market |
 | `BAD_FILE_VALUE` / `ERROR` | unparseable value / fetch error |
@@ -144,11 +144,23 @@ Outputs:
     (Game/Music segment revenue and operating income, discrete quarters summing
     to the annual). *Caveats:* single-segment filers and post-April-2024 periods
     (no more 四半期 reports) yield little/no structured segment data.
-  - **Korea / Taiwan.** Segment/geographic data is **footnote-only** (KR 주석; TW
-    TIFRS 附註) and exposed by **no free API** — OpenDART, FinMind and the TWSE
-    OpenAPI all stop at the primary statements. Those rows return
-    `SEGMENT_SOURCE_UNAVAILABLE`. Reconciling them would need an HTML/PDF footnote
-    extractor (KR: OpenDART `document.xml`; TW: MOPS TIFRS report) or a paid feed
+  - **Korea (OpenDART notes).** KR segment/geo lives in the financial-statement
+    notes, not the primary statements — so the tool downloads the full periodic
+    report (`document.xml`), finds the 영업부문 note, and parses its HTML tables.
+    **Geographic revenue** (지역별 매출) is reconciled for **Q1–Q3** by reading the
+    note's discrete 3-month (3개월) column, with the reported unit (백만원/천원)
+    handled and region names mapped (中/한국/미국/… ↔ China/Korea/US/…). Verified on
+    DB HiTek (China/Korea/US/Japan quarterly geographic revenue). *Limitations:*
+    (a) geographic **operating income** isn't broken out by region in KR filings →
+    `MISSING_IN_API`; (b) **Q4** needs the annual report, whose note uses a
+    different (transposed, fragmented) table layout that isn't parsed yet →
+    `MISSING_IN_API`; (c) **business-segment** splits are read for multi-segment
+    filers where a 부문별 table exists (single-segment filers → `MISSING_IN_API`);
+    map an English label to the Korean row name in `segment_members.csv` if needed.
+  - **Taiwan.** Segment/geographic data is **footnote-only** (TIFRS 附註, PDF/HTML
+    on MOPS) and exposed by **no free API** — FinMind and the TWSE OpenAPI stop at
+    the primary statements. Those rows return `SEGMENT_SOURCE_UNAVAILABLE`.
+    Reconciling them would need a MOPS PDF/HTML footnote extractor or a paid feed
     (TEJ / Capital IQ / Refinitiv).
 - **Metric coverage.** Income statement: revenue, COGS, gross profit, operating
   income, pre-tax income, net income, basic & diluted EPS. Balance sheet: current

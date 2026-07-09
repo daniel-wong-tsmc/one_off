@@ -56,8 +56,9 @@ only `financial_value` (no `financial_report_value`).
 - `run()` — per row: resolve company (registry) → map financial_code (metric_map) → fetch (memoized per company/metric, only needed years) → normalize to millions (÷1e6; per-share direct) → compare (1% money, ±0.02 EPS) → status.
 - Segment rows are routed by market: US → `EdgarDimensional`; JP →
   `EdinetSource.segment_quarterly` (dimensional segment/geo facts from EDINET
-  reports, de-cumulated); KR/TW → `SEGMENT_SOURCE_UNAVAILABLE` (footnote-only,
-  no free API).
+  reports, de-cumulated); KR → `OpenDartSource.segment_quarterly` (parses the
+  영업부문 note tables from `document.xml`; geo revenue Q1–Q3 working); TW →
+  `SEGMENT_SOURCE_UNAVAILABLE` (footnote-only MOPS PDF, no free API).
 
 ## Config (user-editable, drives everything)
 
@@ -79,7 +80,7 @@ Marketech 6196 (TW), Socionext 6526 (JP).
 |---|---|---|---|---|
 | Income statement (rev/COGS/op-inc/pre-tax/net-inc/EPS) | ✅ | ✅ | ✅ | ✅ (EPS recent-only, J-Quants; diluted EPS n/a) |
 | Balance sheet (assets/liabs/equity) | ✅ | ✅ | ✅ | ✅ |
-| Segment / geo (4 files) | ✅ | ⛔ footnote-only | ⛔ footnote-only | ✅ (EDINET dimensional XBRL) |
+| Segment / geo (4 files) | ✅ | 🟡 geo revenue Q1–Q3 (DART notes) | ⛔ footnote-only (MOPS PDF) | ✅ (EDINET dimensional XBRL) |
 
 ## Key assumptions — ✅ NOW VALIDATED against real sample rows
 
@@ -137,17 +138,27 @@ core assumptions checked out:
    `segment_members.csv` (JP member = a substring of the XBRL member local-name).
    Caveat: single-segment filers (Socionext) and post-Apr-2024 periods (no more
    四半期 reports) have little/no structured segment data → partial coverage.
-4. **Korea / Taiwan segment/geo** — confirmed **not available via any free API**:
-   the data lives only in filing notes/footnotes (KR 주석 / TW TIFRS 附註), not in
-   OpenDART's or FinMind's/TWSE's statement endpoints. Those rows now return
-   `SEGMENT_SOURCE_UNAVAILABLE`. Building it would require an HTML/PDF footnote
-   extractor (KR: OpenDART `document.xml` DS001; TW: MOPS TIFRS report) or a paid
-   feed (TEJ / Capital IQ / Refinitiv) — deferred by design.
-5. **Expand `metric_map` + per-source field maps** — income statement (rev, COGS,
+4. **Korea segment/geo** — **started (geo revenue Q1–Q3 working).**
+   `OpenDartSource.segment_quarterly` downloads the full periodic report
+   (`document.xml`, DS001), finds the 영업부문 note, and parses its HTML tables:
+   region-as-rows quarterly tables, unit-aware (백만원/천원), reading the discrete
+   3개월 column, with Korean↔English region canonicalization. Validated on DB HiTek
+   (China/Korea/US/Japan quarterly geo revenue, exact). **Open work:** (a) **Q4**
+   — the annual (사업보고서) note uses a transposed, fragmented table layout that
+   isn't parsed yet (→ MISSING); (b) **business segments** — `_segment_value`
+   parses a 부문별 매출/영업이익 table for multi-segment filers but is untested
+   (DB HiTek/ADTech are single-segment); find a multi-segment KR filer (e.g. LG
+   Electronics 066570) to validate/refine; (c) geo **operating income** isn't
+   disclosed by region in KR filings (→ MISSING, by design).
+5. **Taiwan segment/geo** — **not available via any free API.** MOPS TIFRS
+   footnotes are PDF/HTML only (FinMind & TWSE OpenAPI stop at primary
+   statements). Rows return `SEGMENT_SOURCE_UNAVAILABLE`. Needs a MOPS PDF/HTML
+   footnote extractor or a paid feed (TEJ / Capital IQ / Refinitiv).
+6. **Expand `metric_map` + per-source field maps** — income statement (rev, COGS,
    gross profit, op-inc, pre-tax, net-inc, basic/diluted EPS) and balance sheet
    (current/total assets, A/P, current/total liabilities, equity) are wired with
    verified field names. Add more `financial_code`s as new ones appear.
-6. **Full-run performance** — EDINET date-scanning is slow for many JP companies
+7. **Full-run performance** — EDINET date-scanning is slow for many JP companies
    × years on first run (cached after), and now segment extraction adds more
    report fetches. Consider a prebuilt EDINET doc index if the JP universe is
    large. (Cold-cache runs can transiently miss a JP report; a warm-cache re-run

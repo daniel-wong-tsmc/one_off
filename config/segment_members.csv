@@ -18,5 +18,10 @@ company_id,label,member
 # 301,Music,Music
 # 301,Imaging & Sensing Solutions,ImagingAndSensingSolutions
 #
-# Korea / Taiwan: segment/geo is footnote-only and not in any free API, so those
-# rows report SEGMENT_SOURCE_UNAVAILABLE regardless of what is mapped here.
+# Korea (OpenDART notes): geographic revenue matches by region name automatically
+# (no mapping needed); for BUSINESS segments, `member` overrides the label to the
+# Korean 부문 row name in the note, e.g.
+# 103,Foundry,파운드리
+#
+# Taiwan: segment/geo is footnote-only (MOPS TIFRS PDF) and not in any free API,
+# so those rows report SEGMENT_SOURCE_UNAVAILABLE regardless of what is mapped here.
