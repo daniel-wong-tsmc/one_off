@@ -55,6 +55,30 @@ python verify_earnings.py --data-dir ./data --out-dir ./out --export
 python verify_earnings.py --self-test
 ```
 
+### Pull a standalone reference, then fuzzy-match offline
+
+Instead of hitting the APIs live per row, you can pull a **reference** of every
+configured company once, then reconcile your files against it repeatedly (offline,
+fast) with fuzzy label matching:
+
+```bash
+# 1. Pull the reference (slow — Japan EDINET + Taiwan PDFs; caches as it goes):
+python verify_earnings.py --dump --dump-seg --dump-years 2019-2025 --out-dir ./out
+#    -> ./out/reference/FA.csv, Seg_Geo_Revenue.csv, Seg_Seg_Revenue.csv (your schema)
+
+# 2. Fuzzy-match your files against it (no API calls):
+python verify_earnings.py --data-dir ./data --reference ./out/reference --out-dir ./out
+```
+
+`--reference` matches your `financial_code`s via `metric_map`, and your segment/geo
+`segment_code` labels by **fuzzy matching** — canonical region (e.g. `China`→`CN`,
+`North America`→`US`), then exact / substring / string-similarity — so labels that
+differ from the source's native names (US XBRL members, Chinese segment names) still
+line up. Each matched row's `note` records *how* it matched. Values use the same
+tolerances (1% money, ±0.02 EPS). Rows with no reference counterpart →
+`MISSING_IN_REFERENCE`. (`--dump` alone does statements only; add `--dump-seg` for
+segment/geo. China segment/geo is excluded — semi-annual only.)
+
 Outputs:
 - `out/verification_results.csv` — every row with a status.
 - `out/mismatches.csv` — only the rows that disagree.
