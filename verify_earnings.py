@@ -715,8 +715,13 @@ class OpenDartSource(Source):
     def _val(self, data, names, sj_divs):
         if not data or data.get("status") != "000":
             return None
+        # match on the account name with all internal whitespace removed: DART
+        # prints subtotals like '지배기업의 소유주에게 귀속되는 자본' with spaces that
+        # vary by filer, so a space-insensitive compare is far more robust.
+        wanted = {re.sub(r"\s", "", n) for n in names}
         for row in data.get("list", []):
-            if (row.get("account_nm") or "").strip() in names and row.get("sj_div") in sj_divs:
+            nm = re.sub(r"\s", "", row.get("account_nm") or "")
+            if nm in wanted and row.get("sj_div") in sj_divs:
                 raw = (row.get("thstrm_amount") or "").replace(",", "").strip()
                 try:
                     return float(raw)
@@ -1623,38 +1628,57 @@ def _month_last_day(y, m):
 
 class EdinetSource(Source):
     market = "jp"
-    # canonical -> XBRL element id. Read at CurrentYTDDuration (quarterly report)
-    # or CurrentYearDuration (annual securities report); YTD values de-cumulated.
-    # Only absolute-yen flow metrics: their YTD values de-cumulate exactly and
-    # are immune to share-count changes. EPS is deliberately excluded because
-    # YTD EPS is restated across stock splits, so differencing it is invalid
-    # (Japan EPS comes from J-Quants for recent quarters instead).
+    # canonical -> XBRL element id(s), tried in order. Read at CurrentYTDDuration
+    # (quarterly report) or CurrentYearDuration (annual securities report); YTD
+    # values de-cumulated. Each metric lists the Japanese-GAAP element (jppfs_cor)
+    # AND the IFRS element (jpigp_cor, suffixed …IFRS) because a filer uses one
+    # accounting standard or the other — big manufacturers (Toyota, AGC, Panasonic,
+    # …) file IFRS, so the JGAAP-only name alone silently missed them. Only
+    # absolute-yen flow metrics: their YTD values de-cumulate exactly and are
+    # immune to share-count changes. EPS is deliberately excluded because YTD EPS
+    # is restated across stock splits (Japan EPS comes from J-Quants instead).
     metric_map = {
         # flow (income statement): read at *Duration contexts, de-cumulated
-        "REVENUE": "jppfs_cor:NetSales",
-        "COGS": "jppfs_cor:CostOfSales",
-        "GROSS_PROFIT": "jppfs_cor:GrossProfit",
-        "OPERATING_INCOME": "jppfs_cor:OperatingIncome",
-        "PRE_TAX_INCOME": "jppfs_cor:IncomeBeforeIncomeTaxes",
-        "NET_INCOME": "jppfs_cor:ProfitLossAttributableToOwnersOfParent",
-        "TAX_EXPENSE": "jppfs_cor:IncomeTaxes",
-        "NET_INCOME_INC_NCI": "jppfs_cor:ProfitLoss",
-        "SGA_EXPENSE": "jppfs_cor:SellingGeneralAndAdministrativeExpenses",
+        "REVENUE": ["jppfs_cor:NetSales", "jpigp_cor:NetSalesIFRS",
+                    "jpigp_cor:RevenueIFRS", "jpigp_cor:Revenue2IFRS"],
+        "COGS": ["jppfs_cor:CostOfSales", "jpigp_cor:CostOfSalesIFRS"],
+        "GROSS_PROFIT": ["jppfs_cor:GrossProfit", "jpigp_cor:GrossProfitIFRS"],
+        "OPERATING_INCOME": ["jppfs_cor:OperatingIncome",
+                             "jpigp_cor:OperatingProfitLossIFRS"],
+        "PRE_TAX_INCOME": ["jppfs_cor:IncomeBeforeIncomeTaxes",
+                           "jpigp_cor:ProfitLossBeforeTaxIFRS"],
+        "NET_INCOME": ["jppfs_cor:ProfitLossAttributableToOwnersOfParent",
+                       "jpigp_cor:ProfitLossAttributableToOwnersOfParentIFRS"],
+        "TAX_EXPENSE": ["jppfs_cor:IncomeTaxes", "jpigp_cor:IncomeTaxExpenseIFRS"],
+        "NET_INCOME_INC_NCI": ["jppfs_cor:ProfitLoss", "jpigp_cor:ProfitLossIFRS"],
+        "SGA_EXPENSE": ["jppfs_cor:SellingGeneralAndAdministrativeExpenses",
+                        "jpigp_cor:SellingGeneralAndAdministrativeExpensesIFRS"],
         # stock (balance sheet): read at *Instant contexts, point-in-time
-        "ACCOUNTS_PAYABLE": "jppfs_cor:AccountsPayableTrade",
-        "CURRENT_ASSETS": "jppfs_cor:CurrentAssets",
-        "TOTAL_ASSETS": "jppfs_cor:Assets",
-        "CURRENT_LIABILITIES": "jppfs_cor:CurrentLiabilities",
-        "TOTAL_LIABILITIES": "jppfs_cor:Liabilities",
-        "TOTAL_EQUITY": "jppfs_cor:NetAssets",
-        "ACCOUNTS_RECEIVABLE": "jppfs_cor:NotesAndAccountsReceivableTrade",
-        "CASH_AND_CASH_EQUIVALENTS": "jppfs_cor:CashAndDeposits",
-        "INVENTORIES": "jppfs_cor:Inventories",
-        "PROPERTY_PLANT_AND_EQUIPMENT": "jppfs_cor:PropertyPlantAndEquipment",
-        # parent-owners' equity (excludes NCI), vs TOTAL_EQUITY = NetAssets.
-        "SHAREHOLDERS_EQUITY": "jppfs_cor:ShareholdersEquity",
-        "NON_CONTROL_INTEREST": "jppfs_cor:NonControllingInterests",
-        "CONTRACT_LIABILITIES": "jppfs_cor:ContractLiabilities",
+        "ACCOUNTS_PAYABLE": ["jppfs_cor:AccountsPayableTrade",
+                             "jpigp_cor:TradeAndOtherPayablesCLIFRS",
+                             "jpigp_cor:TradePayablesCLIFRS"],
+        "CURRENT_ASSETS": ["jppfs_cor:CurrentAssets", "jpigp_cor:CurrentAssetsIFRS"],
+        "TOTAL_ASSETS": ["jppfs_cor:Assets", "jpigp_cor:AssetsIFRS"],
+        "CURRENT_LIABILITIES": ["jppfs_cor:CurrentLiabilities",
+                                "jpigp_cor:CurrentLiabilitiesIFRS"],
+        "TOTAL_LIABILITIES": ["jppfs_cor:Liabilities", "jpigp_cor:LiabilitiesIFRS"],
+        "TOTAL_EQUITY": ["jppfs_cor:NetAssets", "jpigp_cor:EquityIFRS"],
+        "ACCOUNTS_RECEIVABLE": ["jppfs_cor:NotesAndAccountsReceivableTrade",
+                                "jpigp_cor:TradeAndOtherReceivablesCAIFRS",
+                                "jpigp_cor:TradeReceivablesCAIFRS"],
+        "CASH_AND_CASH_EQUIVALENTS": ["jppfs_cor:CashAndDeposits",
+                                      "jpigp_cor:CashAndCashEquivalentsIFRS"],
+        "INVENTORIES": ["jppfs_cor:Inventories", "jpigp_cor:InventoriesCAIFRS"],
+        "PROPERTY_PLANT_AND_EQUIPMENT": ["jppfs_cor:PropertyPlantAndEquipment",
+                                         "jpigp_cor:PropertyPlantAndEquipmentIFRS"],
+        # parent-owners' equity (excludes NCI), vs TOTAL_EQUITY = NetAssets/Equity.
+        "SHAREHOLDERS_EQUITY": ["jppfs_cor:ShareholdersEquity",
+                                "jpigp_cor:EquityAttributableToOwnersOfParentIFRS"],
+        "NON_CONTROL_INTEREST": ["jppfs_cor:NonControllingInterests",
+                                 "jpigp_cor:NonControllingInterestsIFRS"],
+        "CONTRACT_LIABILITIES": ["jppfs_cor:ContractLiabilities",
+                                 "jpigp_cor:ContractLiabilitiesCLIFRS",
+                                 "jpigp_cor:ContractLiabilitiesIFRS"],
     }
     note = ""
 
@@ -1724,14 +1748,22 @@ class EdinetSource(Source):
         hdr = rows[0]
         eid, ctxi, vali = hdr.index("要素ID"), hdr.index("コンテキストID"), hdr.index("値")
         elt = self.metric_map[metric]
+        cands = elt if isinstance(elt, list) else [elt]   # JGAAP + IFRS variants
         if CANONICAL[metric]["kind"] == "stock":   # balance sheet: point-in-time
             ctx = "CurrentYearInstant" if is_annual else "CurrentQuarterInstant"
         else:                                       # income statement: period flow
             ctx = "CurrentYearDuration" if is_annual else "CurrentYTDDuration"
+        # index the consolidated facts for this context, then take the first
+        # candidate present (a filer reports under one standard, so only its
+        # JGAAP or its IFRS element exists — no ambiguity between the two).
+        vals = {}
         for r in rows[1:]:
-            if r[eid] == elt and r[ctxi] == ctx and "NonConsolidated" not in r[ctxi]:
+            if r[ctxi] == ctx and "NonConsolidated" not in r[ctxi]:
+                vals.setdefault(r[eid], r[vali])
+        for c in cands:
+            if c in vals:
                 try:
-                    return float(r[vali])
+                    return float(vals[c])
                 except ValueError:
                     return None
         return None

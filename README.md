@@ -154,9 +154,13 @@ Outputs:
     their year-to-date XBRL values are de-cumulated into discrete quarters.
   - **EDINET covers revenue / operating income / net income** (de-cumulated)
     **and balance-sheet items** (total assets, trade payables, net assets — read
-    at instant contexts, point-in-time). **EPS is intentionally excluded**:
-    year-to-date EPS is restated across stock splits (e.g. Socionext FY2024), so
-    differencing it is invalid. Japan EPS comes from J-Quants (recent quarters).
+    at instant contexts, point-in-time), plus receivables, cash, inventory, PP&E,
+    parent equity, NCI, SG&A, tax and net-income-incl-NCI. Each metric is read
+    under **both Japanese GAAP (`jppfs_cor`) and IFRS (`jpigp_cor`, …IFRS)** element
+    names, so IFRS filers (Toyota, AGC, Panasonic, …) resolve too rather than
+    silently missing. **EPS is intentionally excluded**: year-to-date EPS is
+    restated across stock splits (e.g. Socionext FY2024), so differencing it is
+    invalid. Japan EPS comes from J-Quants (recent quarters).
   - Any period neither source can reach (older than the J-Quants window *and*
     with no EDINET filing) returns `MISSING_IN_API`. Because the J-Quants free
     window rolls forward, cache older quarters sooner rather than later.
