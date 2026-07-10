@@ -30,13 +30,40 @@ BASIC_EPS,EPS_BASIC
 EPS_DILUTED,EPS_DILUTED
 DILUTED_EPS,EPS_DILUTED
 
+# --- income statement, additional expense / profit lines (flow) ---
+OPERATING_EXPENSE,OPERATING_EXPENSE
+RD_EXPENSE,RD_EXPENSE
+SGA_EXPENSE,SGA_EXPENSE
+TAX_EXPENSE,TAX_EXPENSE
+# consolidated net income INCLUDING non-controlling interest (parent+NCI), vs
+# NET_INCOME which is the parent-owners' portion only.
+NET_INCOME_INC_NCI,NET_INCOME_INC_NCI
+
+# --- cash-flow statement (flow) ---
+# US covered via EDGAR; TW/KR cash-flow is YTD-cumulative and only KR is
+# de-cumulated here, so TW reports UNSUPPORTED_METRIC for these (accurate).
+DEPRECIATION_AND_AMORTIZATION,DEPRECIATION_AND_AMORTIZATION
+CASH_FROM_OPERATION,CASH_FROM_OPERATION
+CAPEX,CAPEX
+# a purchase-of-PP&E-and-intangibles line is the same as capital expenditure
+PURCHASE_OF_PROPERTY_AND_PLANT_AND_EQUIPMENT_AND_INTANGIBLE_ASSETS,CAPEX
+
 # --- balance sheet (stock, point-in-time) ---
 ACCOUNTS_PAYABLE,ACCOUNTS_PAYABLE
+ACCOUNTS_RECEIVABLE,ACCOUNTS_RECEIVABLE
+CASH_AND_CASH_EQUIVALENTS,CASH_AND_CASH_EQUIVALENTS
+INVENTORIES,INVENTORIES
+PROPERTY_PLANT_AND_EQUIPMENT,PROPERTY_PLANT_AND_EQUIPMENT
+CONTRACT_LIABILITIES,CONTRACT_LIABILITIES
 CURRENT_ASSETS,CURRENT_ASSETS
 TOTAL_ASSETS,TOTAL_ASSETS
 CURRENT_LIABILITIES,CURRENT_LIABILITIES
 TOTAL_LIABILITIES,TOTAL_LIABILITIES
 TOTAL_EQUITY,TOTAL_EQUITY
+# equity attributable to the parent's owners (excludes NCI); differs from
+# TOTAL_EQUITY in KR/TW/JP, where total equity includes NCI.
+SHAREHOLDERS_EQUITY,SHAREHOLDERS_EQUITY
+NON_CONTROL_INTEREST,NON_CONTROL_INTEREST
 
 # --- derived ratio / turnover / delta metrics -> UNSUPPORTED_DERIVED ---
 # (not fetchable from one line item; listed so they're categorized, not silently
@@ -49,7 +76,39 @@ DAYS_OF_INVENTORY,DERIVED
 DAYS_SALES_OUTSTANDING,DERIVED
 DAYS_PAYABLE_OUTSTANDING,DERIVED
 INVENTORY_TURNOVER,DERIVED
+# computed subtotals / ratios the user's files carry (not a single line item):
+QUICK_ASSETS,DERIVED
+FREE_CASH_FLOW,DERIVED
+TAX_RATE,DERIVED
+RD_EXPENSE_OF_REVENUE,DERIVED
+SGA_EXPENSE_OF_REVENUE,DERIVED
+
+# --- operational KPIs / non-GAAP figures -> UNSUPPORTED_NONFINANCIAL ---
+# Not drawn from the audited financial statements, so no API line item matches.
+# Mapped to NON_FINANCIAL (any WAFER*/UTILIZATION/BACKLOG/BOOKING/…/NONGAAP code
+# is auto-detected too) so they're categorized, not reported as NO_MAPPING.
+FULL_TIME_EMPLOYEES,NON_FINANCIAL
+UTILIZATION,NON_FINANCIAL
+WAFER_ASP,NON_FINANCIAL
+WAFER_SALES,NON_FINANCIAL
+WAFER_SALES_USD,NON_FINANCIAL
+WAFER_SALES_TWD_YTD,NON_FINANCIAL
+BILLING 12INCH,NON_FINANCIAL
+CAPACITY_12INCH,NON_FINANCIAL
+BACKLOG,NON_FINANCIAL
+BOOKING,NON_FINANCIAL
+BOOK_TO_BILL_RATIO,NON_FINANCIAL
+FX_RATE,NON_FINANCIAL
+NON_GAAP_REVENUE,NON_FINANCIAL
+NONGAAP_GROSS_MARGIN,NON_FINANCIAL
+ADJUSTED_OPERATING_MAFGIN,NON_FINANCIAL
 
 # --- not yet wired (ambiguous source field); left as NO_MAPPING on purpose ---
-# MARKETABLE_SECURITIES -> which line item varies by filer (AFS vs FVTPL vs cash
-#   equivalents); map per your definition before enabling.
+# These two are deliberately unmapped: mapping them to the wrong line item would
+# cause false MISMATCHes. Map per your own definition to enable.
+# MARKETABLE_SECURITIES -> varies by filer (short-term investments vs AFS vs FVTPL
+#   securities vs cash equivalents). e.g. for a US filer add:
+#   MARKETABLE_SECURITIES,MARKETABLE_SECURITIES  (after wiring a tag in CANONICAL)
+# OTHER_EXPENSE -> "other" is a residual whose contents differ by filer (non-
+#   operating expense, other operating expense, other comprehensive items); pin it
+#   to a specific canonical metric before enabling.

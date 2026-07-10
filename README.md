@@ -31,7 +31,13 @@ Two small CSVs under `config/` drive everything:
   for non-December fiscal years (e.g. Qorvo = 3, Socionext = 3).
 - **`config/metric_map.csv`** — map your `financial_code` values (e.g.
   `REVENUE`, `ACCOUNTS_PAYABLE`) to a canonical metric. Codes not listed here are
-  reported as `NO_MAPPING` rather than silently skipped.
+  reported as `NO_MAPPING` rather than silently skipped. Ships with the common
+  income-statement, balance-sheet and cash-flow lines wired across all markets
+  (revenue/COGS/margins-inputs, receivables, cash, inventory, PP&E, equity,
+  contract liabilities, R&D/SG&A/tax expense, operating cash flow, capex, …).
+  Computed ratios/subtotals are routed to `UNSUPPORTED_DERIVED`, and operational
+  or non-GAAP KPIs (headcount, wafer volume/ASP, utilization, backlog, FX, …) to
+  `UNSUPPORTED_NONFINANCIAL`, so neither is mistaken for an un-mapped code.
 
 Your **`company_id_mapping`** file (`company_id;external_mapped_name`) is picked
 up automatically from `--data-dir` (a `.csv` suffix is optional; override the
@@ -127,7 +133,8 @@ Outputs:
 | `MISMATCH` | **API and file disagree** — the thing you asked for |
 | `MISSING_IN_API` | source has no value for that period (e.g. JP quarterly) |
 | `NO_MAPPING` | `financial_code` not in `metric_map.csv` |
-| `UNSUPPORTED_DERIVED` | computed ratio / turnover-days / QoQ-delta metric (e.g. `NET_MARGIN`, `CASH_CONVERSION_CYCLE`, `*_QOQ`) — not a single as-filed line item, so not reconcilable against one API field |
+| `UNSUPPORTED_DERIVED` | computed ratio / turnover-days / subtotal / QoQ-delta metric (e.g. `NET_MARGIN`, `CASH_CONVERSION_CYCLE`, `QUICK_ASSETS`, `TAX_RATE`, `FREE_CASH_FLOW`, `*_QOQ`) — not a single as-filed line item, so not reconcilable against one API field |
+| `UNSUPPORTED_NONFINANCIAL` | operational KPI or company-defined non-GAAP figure (e.g. `FULL_TIME_EMPLOYEES`, `WAFER_SALES`, `UTILIZATION`, `BACKLOG`, `BOOK_TO_BILL_RATIO`, `FX_RATE`, `NON_GAAP_REVENUE`) — not drawn from the audited statements, so no filing API line item corresponds to it |
 | `COMPANY_NOT_CONFIGURED` | `company_id` not in `company_registry.csv` |
 | `UNSUPPORTED_METRIC` | that market's source doesn't expose that metric |
 | `NO_SEGMENT_MAPPING` | business-segment label not resolvable — add to `segment_members.csv` (US: XBRL member; JP: member substring; KR: 부문 name; TW: 部門 name). Geographic labels auto-match by region name |

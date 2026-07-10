@@ -58,6 +58,27 @@ CANONICAL = {
     "CURRENT_LIABILITIES": {"kind": "stock", "per_share": False},
     "TOTAL_LIABILITIES":   {"kind": "stock", "per_share": False},
     "TOTAL_EQUITY":        {"kind": "stock", "per_share": False},
+    # --- additional balance-sheet line items (stock, point-in-time) ---
+    "ACCOUNTS_RECEIVABLE":          {"kind": "stock", "per_share": False},
+    "CASH_AND_CASH_EQUIVALENTS":    {"kind": "stock", "per_share": False},
+    "INVENTORIES":                  {"kind": "stock", "per_share": False},
+    "PROPERTY_PLANT_AND_EQUIPMENT": {"kind": "stock", "per_share": False},
+    # equity attributable to the parent's owners (excludes non-controlling
+    # interest); distinct from TOTAL_EQUITY, which includes NCI in KR/TW/JP.
+    "SHAREHOLDERS_EQUITY":          {"kind": "stock", "per_share": False},
+    "NON_CONTROL_INTEREST":         {"kind": "stock", "per_share": False},
+    "CONTRACT_LIABILITIES":         {"kind": "stock", "per_share": False},
+    # --- additional income-statement / cash-flow line items (flow, discrete) ---
+    "OPERATING_EXPENSE":            {"kind": "flow",  "per_share": False},
+    "RD_EXPENSE":                   {"kind": "flow",  "per_share": False},
+    "SGA_EXPENSE":                  {"kind": "flow",  "per_share": False},
+    "TAX_EXPENSE":                  {"kind": "flow",  "per_share": False},
+    # consolidated net income INCLUDING non-controlling interest (vs NET_INCOME,
+    # which is the portion attributable to the parent's owners).
+    "NET_INCOME_INC_NCI":           {"kind": "flow",  "per_share": False},
+    "DEPRECIATION_AND_AMORTIZATION": {"kind": "flow", "per_share": False},
+    "CASH_FROM_OPERATION":          {"kind": "flow",  "per_share": False},
+    "CAPEX":                        {"kind": "flow",  "per_share": False},
 }
 
 # Derived / ratio metrics (margins, turnover days, cash-conversion cycle,
@@ -74,6 +95,13 @@ DERIVED_METRICS = {
     "DAYS_SALES_OUTSTANDING", "DAYS_PAYABLE_OUTSTANDING",
     "INVENTORY_TURNOVER", "ASSET_TURNOVER", "CURRENT_RATIO", "QUICK_RATIO",
     "ROE", "ROA", "DEBT_TO_EQUITY",
+    # computed subtotals / ratios / cash-flow deltas the user's files carry that
+    # aren't a single as-filed line item (so not reconcilable against one field):
+    "QUICK_ASSETS",              # current assets − inventory − prepaids (a subtotal)
+    "FREE_CASH_FLOW",            # CFO − capex
+    "TAX_RATE",                  # tax expense / pre-tax income
+    "RD_EXPENSE_OF_REVENUE",     # R&D / revenue
+    "SGA_EXPENSE_OF_REVENUE",    # SG&A / revenue
 }
 
 
@@ -84,6 +112,35 @@ def is_derived_code(code: str, canonical: str) -> bool:
         return True
     c = code.upper()
     return c in DERIVED_METRICS or c.endswith("_QOQ") or c.endswith("_YOY")
+
+
+# Operational KPIs and company-defined non-GAAP figures that are NOT drawn from
+# the audited financial statements (headcount, wafer volume/ASP, utilization,
+# backlog/bookings, book-to-bill, FX rates, non-GAAP revenue/margins). No API
+# line item corresponds to them, so we flag them UNSUPPORTED_NONFINANCIAL rather
+# than NO_MAPPING (which would wrongly imply "you just forgot to map this").
+# Map a code to `NON_FINANCIAL` in metric_map.csv, or match the keywords below.
+NONFINANCIAL_SENTINEL = "NON_FINANCIAL"
+NONFINANCIAL_METRICS = {
+    "FULL_TIME_EMPLOYEES", "UTILIZATION", "WAFER_ASP", "WAFER_SALES",
+    "WAFER_SALES_USD", "WAFER_SALES_TWD_YTD", "BILLING 12INCH", "BILLING_12INCH",
+    "CAPACITY_12INCH", "BACKLOG", "BOOKING", "BOOK_TO_BILL_RATIO", "FX_RATE",
+    "NON_GAAP_REVENUE", "NONGAAP_GROSS_MARGIN", "ADJUSTED_OPERATING_MAFGIN",
+    "ADJUSTED_OPERATING_MARGIN",
+}
+_NONFIN_KEYWORDS = ("WAFER", "UTILIZATION", "BACKLOG", "BOOKING", "BOOK_TO_BILL",
+                    "EMPLOYEE", "HEADCOUNT", "FX_RATE", "NON_GAAP", "NONGAAP",
+                    "12INCH", "12_INCH")
+
+
+def is_nonfinancial_code(code: str, canonical: str) -> bool:
+    """True if this financial_code is an operational KPI or non-GAAP figure that
+    isn't an audited-statement line item, so it can't be reconciled against the
+    filing APIs at all."""
+    if canonical == NONFINANCIAL_SENTINEL:
+        return True
+    c = code.upper()
+    return c in NONFINANCIAL_METRICS or any(k in c for k in _NONFIN_KEYWORDS)
 
 SESSION = requests.Session()
 
@@ -188,6 +245,36 @@ class EdgarSource(Source):
         "CURRENT_LIABILITIES": ["LiabilitiesCurrent"],
         "TOTAL_LIABILITIES": ["Liabilities"],
         "TOTAL_EQUITY": ["StockholdersEquity"],
+        "ACCOUNTS_RECEIVABLE": ["AccountsReceivableNetCurrent", "ReceivablesNetCurrent",
+                                "AccountsReceivableNet",
+                                "AccountsAndOtherReceivablesNetCurrent"],
+        "CASH_AND_CASH_EQUIVALENTS": [
+            "CashAndCashEquivalentsAtCarryingValue",
+            "CashAndCashEquivalentsAtCarryingValueIncludingDiscontinuedOperations"],
+        "INVENTORIES": ["InventoryNet"],
+        "PROPERTY_PLANT_AND_EQUIPMENT": ["PropertyPlantAndEquipmentNet"],
+        # parent-owners' equity (excludes NCI); same tag as TOTAL_EQUITY in
+        # US-GAAP, where StockholdersEquity is already parent-only.
+        "SHAREHOLDERS_EQUITY": ["StockholdersEquity"],
+        "NON_CONTROL_INTEREST": ["MinorityInterest"],
+        "CONTRACT_LIABILITIES": ["ContractWithCustomerLiabilityCurrent",
+                                 "ContractWithCustomerLiability"],
+        "OPERATING_EXPENSE": ["OperatingExpenses", "OperatingCostsAndExpenses",
+                              "CostsAndExpenses"],
+        "RD_EXPENSE": ["ResearchAndDevelopmentExpense",
+                       "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost"],
+        "SGA_EXPENSE": ["SellingGeneralAndAdministrativeExpense",
+                        "GeneralAndAdministrativeExpense"],
+        "TAX_EXPENSE": ["IncomeTaxExpenseBenefit"],
+        "NET_INCOME_INC_NCI": ["ProfitLoss"],
+        "DEPRECIATION_AND_AMORTIZATION": ["DepreciationDepletionAndAmortization",
+                                          "DepreciationAmortizationAndAccretionNet",
+                                          "DepreciationAndAmortization", "Depreciation"],
+        "CASH_FROM_OPERATION": [
+            "NetCashProvidedByUsedInOperatingActivities",
+            "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"],
+        "CAPEX": ["PaymentsToAcquirePropertyPlantAndEquipment",
+                  "PaymentsToAcquireProductiveAssets"],
     }
 
     def __init__(self):
@@ -572,6 +659,26 @@ class OpenDartSource(Source):
         "CURRENT_LIABILITIES": (["유동부채"], ("BS",)),
         "TOTAL_LIABILITIES": (["부채총계"], ("BS",)),
         "TOTAL_EQUITY": (["자본총계"], ("BS",)),
+        "ACCOUNTS_RECEIVABLE": (["매출채권", "매출채권및기타채권",
+                                 "매출채권및기타유동채권"], ("BS",)),
+        "CASH_AND_CASH_EQUIVALENTS": (["현금및현금성자산"], ("BS",)),
+        "INVENTORIES": (["재고자산"], ("BS",)),
+        "PROPERTY_PLANT_AND_EQUIPMENT": (["유형자산"], ("BS",)),
+        # parent-owners' equity (지배기업 소유주지분) — excludes NCI, unlike 자본총계.
+        "SHAREHOLDERS_EQUITY": (["지배기업의소유주에게귀속되는자본", "지배기업소유주지분",
+                                 "지배기업의소유주지분", "지배기업 소유주지분"], ("BS",)),
+        "NON_CONTROL_INTEREST": (["비지배지분"], ("BS",)),
+        "CONTRACT_LIABILITIES": (["계약부채"], ("BS",)),
+        "SGA_EXPENSE": (["판매비와관리비", "판매비및관리비"], ("IS", "CIS")),
+        "RD_EXPENSE": (["경상연구개발비", "연구개발비"], ("IS", "CIS")),
+        "TAX_EXPENSE": (["법인세비용", "법인세비용(수익)"], ("IS", "CIS")),
+        # 당기순이익 in a consolidated statement is total profit incl. NCI.
+        "NET_INCOME_INC_NCI": (["당기순이익", "당기순이익(손실)", "연결당기순이익",
+                                "분기순이익", "반기순이익"], ("IS", "CIS")),
+        # cash-flow (sj_div 'CF'); YTD-cumulative like the income statement, so the
+        # flow de-cumulation (_to_discrete) turns it into discrete quarters.
+        "CASH_FROM_OPERATION": (["영업활동현금흐름", "영업활동으로인한현금흐름",
+                                 "영업활동으로인한순현금흐름"], ("CF",)),
     }
     REPRT = {1: "11013", 2: "11012", 3: "11014", 4: "11011"}
 
@@ -995,7 +1102,21 @@ class FinMindSource(Source):
         "CURRENT_LIABILITIES": (BS, "CurrentLiabilities"),
         "TOTAL_LIABILITIES": (BS, "Liabilities"),
         "TOTAL_EQUITY": (BS, "Equity"),
+        "ACCOUNTS_RECEIVABLE": (BS, "AccountsReceivableNet"),
+        "CASH_AND_CASH_EQUIVALENTS": (BS, "CashAndCashEquivalents"),
+        "INVENTORIES": (BS, "Inventories"),
+        "PROPERTY_PLANT_AND_EQUIPMENT": (BS, "PropertyPlantAndEquipment"),
+        "SHAREHOLDERS_EQUITY": (BS, "EquityAttributableToOwnersOfParent"),
+        "NON_CONTROL_INTEREST": (BS, "NoncontrollingInterests"),
+        # income statement is discrete-quarterly in FinMind; TAX = 所得稅費用,
+        # OperatingExpenses = 營業費用, IncomeAfterTaxes = 本期淨利 (incl. NCI).
+        "OPERATING_EXPENSE": (IS, "OperatingExpenses"),
+        "TAX_EXPENSE": (IS, "TAX"),
+        "NET_INCOME_INC_NCI": (IS, "IncomeAfterTaxes"),
     }
+    # NOTE: FinMind's cash-flow dataset is YTD-cumulative and this source doesn't
+    # de-cumulate, so CASH_FROM_OPERATION / CAPEX / D&A are intentionally left off
+    # (they'd produce false Q2–Q4 mismatches) and report UNSUPPORTED_METRIC for TW.
 
     def __init__(self):
         self.token = os.environ.get("FINMIND_TOKEN", "")
@@ -1040,10 +1161,15 @@ class AKShareSource(Source):
         "OPERATING_INCOME": (INC, "OPERATE_PROFIT"),         # 营业利润
         "PRE_TAX_INCOME":   (INC, "TOTAL_PROFIT"),           # 利润总额
         "NET_INCOME":       (INC, "PARENT_NETPROFIT"),       # 归母净利润
+        "TAX_EXPENSE":      (INC, "INCOME_TAX"),             # 所得税费用
         "TOTAL_ASSETS":       (BAL, "TOTAL_ASSETS"),         # 资产总计
         "TOTAL_LIABILITIES":  (BAL, "TOTAL_LIABILITIES"),    # 负债合计
         "TOTAL_EQUITY":       (BAL, "TOTAL_EQUITY"),         # 股东权益合计
         "ACCOUNTS_PAYABLE":   (BAL, "ACCOUNTS_PAYABLE"),     # 应付账款
+        "ACCOUNTS_RECEIVABLE":          (BAL, "ACCOUNTS_RECE"),   # 应收账款
+        "CASH_AND_CASH_EQUIVALENTS":    (BAL, "MONETARYFUNDS"),   # 货币资金
+        "INVENTORIES":                  (BAL, "INVENTORY"),       # 存货
+        "PROPERTY_PLANT_AND_EQUIPMENT": (BAL, "FIXED_ASSET"),     # 固定资产
     }
     available = True
 
@@ -1511,6 +1637,9 @@ class EdinetSource(Source):
         "OPERATING_INCOME": "jppfs_cor:OperatingIncome",
         "PRE_TAX_INCOME": "jppfs_cor:IncomeBeforeIncomeTaxes",
         "NET_INCOME": "jppfs_cor:ProfitLossAttributableToOwnersOfParent",
+        "TAX_EXPENSE": "jppfs_cor:IncomeTaxes",
+        "NET_INCOME_INC_NCI": "jppfs_cor:ProfitLoss",
+        "SGA_EXPENSE": "jppfs_cor:SellingGeneralAndAdministrativeExpenses",
         # stock (balance sheet): read at *Instant contexts, point-in-time
         "ACCOUNTS_PAYABLE": "jppfs_cor:AccountsPayableTrade",
         "CURRENT_ASSETS": "jppfs_cor:CurrentAssets",
@@ -1518,6 +1647,14 @@ class EdinetSource(Source):
         "CURRENT_LIABILITIES": "jppfs_cor:CurrentLiabilities",
         "TOTAL_LIABILITIES": "jppfs_cor:Liabilities",
         "TOTAL_EQUITY": "jppfs_cor:NetAssets",
+        "ACCOUNTS_RECEIVABLE": "jppfs_cor:NotesAndAccountsReceivableTrade",
+        "CASH_AND_CASH_EQUIVALENTS": "jppfs_cor:CashAndDeposits",
+        "INVENTORIES": "jppfs_cor:Inventories",
+        "PROPERTY_PLANT_AND_EQUIPMENT": "jppfs_cor:PropertyPlantAndEquipment",
+        # parent-owners' equity (excludes NCI), vs TOTAL_EQUITY = NetAssets.
+        "SHAREHOLDERS_EQUITY": "jppfs_cor:ShareholdersEquity",
+        "NON_CONTROL_INTEREST": "jppfs_cor:NonControllingInterests",
+        "CONTRACT_LIABILITIES": "jppfs_cor:ContractLiabilities",
     }
     note = ""
 
@@ -2317,6 +2454,13 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
                     rec["status"] = "UNSUPPORTED_DERIVED"
                     rec["note"] = ("computed ratio/turnover/delta metric — not a "
                                    "single as-filed line item, so not reconcilable")
+                    results.append(rec); continue
+                if is_nonfinancial_code(code, canonical):
+                    rec["status"] = "UNSUPPORTED_NONFINANCIAL"
+                    rec["note"] = ("operational KPI or non-GAAP figure (headcount, "
+                                   "wafer volume/ASP, utilization, backlog/bookings, "
+                                   "FX, non-GAAP) — not an audited-statement line "
+                                   "item, so not reconcilable against filings")
                     results.append(rec); continue
                 if not canonical:
                     rec["status"] = "NO_MAPPING"
