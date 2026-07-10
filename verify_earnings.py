@@ -1281,8 +1281,13 @@ class AKShareSource(Source):
     annual-report notes on cninfo (巨潮), which would need PDF parsing like Taiwan."""
     market = "cn"
     EM = "https://datacenter.eastmoney.com/securities/api/data/v1/get"
+    # DMSK_* are the compact "abstract" (摘要) reports; G* are the FULL
+    # income/balance/cash-flow statements (many more line items). Both are the
+    # same datacenter API and both YTD-cumulative for flow items.
     INC, BAL = "RPT_DMSK_FN_INCOME", "RPT_DMSK_FN_BALANCE"
-    metric_map = {   # canonical -> (reportName, Eastmoney field)
+    GINC, GBAL, GCF = ("RPT_F10_FINANCE_GINCOME", "RPT_F10_FINANCE_GBALANCE",
+                       "RPT_F10_FINANCE_GCASHFLOW")
+    metric_map = {   # canonical -> (reportName, field | [fields to sum])
         "REVENUE":          (INC, "TOTAL_OPERATE_INCOME"),   # 营业总收入
         "COGS":             (INC, "OPERATE_COST"),           # 营业成本
         "OPERATING_INCOME": (INC, "OPERATE_PROFIT"),         # 营业利润
@@ -1297,6 +1302,22 @@ class AKShareSource(Source):
         "CASH_AND_CASH_EQUIVALENTS":    (BAL, "MONETARYFUNDS"),   # 货币资金
         "INVENTORIES":                  (BAL, "INVENTORY"),       # 存货
         "PROPERTY_PLANT_AND_EQUIPMENT": (BAL, "FIXED_ASSET"),     # 固定资产
+        # ---- from the full statements (G*) ----
+        "SHAREHOLDERS_EQUITY":  (GBAL, "TOTAL_PARENT_EQUITY"),  # 归属母公司股东权益合计
+        "NON_CONTROL_INTEREST": (GBAL, "MINORITY_EQUITY"),      # 少数股东权益
+        "CONTRACT_LIABILITIES": (GBAL, "CONTRACT_LIAB"),        # 合同负债
+        "RD_EXPENSE":           (GINC, "RESEARCH_EXPENSE"),     # 研发费用
+        # 销售费用 + 管理费用 (Chinese GAAP files these as two lines; SG&A = their sum)
+        "SGA_EXPENSE":          (GINC, ["SALE_EXPENSE", "MANAGE_EXPENSE"]),
+        "NET_INCOME_INC_NCI":   (GINC, "NETPROFIT"),           # 净利润 (含少数股东损益)
+        "CASH_FROM_OPERATION":  (GCF, "NETCASH_OPERATE"),      # 经营活动现金流量净额
+        "CAPEX":                (GCF, "CONSTRUCT_LONG_ASSET"),  # 购建固定/无形/其他长期资产
+        # DEPRECIATION_AND_AMORTIZATION is intentionally NOT mapped for China: the
+        # depreciation/amortization add-backs (FA_IR_DEPR / IA_AMORTIZE / …) live in
+        # the cash-flow *supplementary* schedule (补充资料), which A-share issuers
+        # disclose only semi-annually (06-30 H1 + 12-31 FY), never in the Q1/Q3
+        # reports — so it can't be de-cumulated to a discrete quarter. Reports
+        # UNSUPPORTED_METRIC rather than a perpetual (misleading) MISSING.
     }
     available = True
 
@@ -1334,14 +1355,18 @@ class AKShareSource(Source):
 
     def quarterly(self, api_id, metric, fye_month=12, years=None):
         report, field = self.metric_map[metric]
+        fields = field if isinstance(field, (list, tuple)) else [field]
         rows = self._fetch(report, self._secucode(api_id))
         vals = {}
         for r in rows:
-            rd, v = r.get("REPORT_DATE"), r.get(field)
-            if not rd or v is None:
+            rd = r.get("REPORT_DATE")
+            if not rd:
                 continue
-            try:
-                vals[rd[:10]] = float(v)
+            parts = [r.get(f) for f in fields]
+            if all(p is None for p in parts):      # metric absent for this filer
+                continue
+            try:                                   # sum the sub-lines present
+                vals[rd[:10]] = sum(float(p) for p in parts if p is not None)
             except (TypeError, ValueError):
                 pass
         if CANONICAL[metric]["kind"] == "stock":
