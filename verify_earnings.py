@@ -62,6 +62,11 @@ CANONICAL = {
     "ACCOUNTS_RECEIVABLE":          {"kind": "stock", "per_share": False},
     "CASH_AND_CASH_EQUIVALENTS":    {"kind": "stock", "per_share": False},
     "INVENTORIES":                  {"kind": "stock", "per_share": False},
+    # inventory sub-components (only filers that disclose the breakdown on the
+    # face balance sheet carry these — e.g. US semis; others report MISSING).
+    "FINISHED_GOODS":               {"kind": "stock", "per_share": False},
+    "RAW_MATERIALS":                {"kind": "stock", "per_share": False},
+    "WORK_IN_PROCESS":              {"kind": "stock", "per_share": False},
     "PROPERTY_PLANT_AND_EQUIPMENT": {"kind": "stock", "per_share": False},
     # equity attributable to the parent's owners (excludes non-controlling
     # interest); distinct from TOTAL_EQUITY, which includes NCI in KR/TW/JP.
@@ -262,6 +267,15 @@ class EdgarSource(Source):
             "CashAndCashEquivalentsAtCarryingValue",
             "CashAndCashEquivalentsAtCarryingValueIncludingDiscontinuedOperations"],
         "INVENTORIES": ["InventoryNet"],
+        # filers split between the …NetOfReserves and the plain tags, so try both
+        "FINISHED_GOODS": ["InventoryFinishedGoodsNetOfReserves",
+                           "InventoryFinishedGoods"],
+        "RAW_MATERIALS": ["InventoryRawMaterialsNetOfReserves",
+                          "InventoryRawMaterials",
+                          "InventoryRawMaterialsAndSuppliesNetOfReserves",
+                          "InventoryRawMaterialsAndSupplies"],
+        "WORK_IN_PROCESS": ["InventoryWorkInProcessNetOfReserves",
+                            "InventoryWorkInProcess"],
         "PROPERTY_PLANT_AND_EQUIPMENT": ["PropertyPlantAndEquipmentNet"],
         # parent-owners' equity (excludes NCI); same tag as TOTAL_EQUITY in
         # US-GAAP, where StockholdersEquity is already parent-only.
@@ -1767,6 +1781,16 @@ class EdinetSource(Source):
         "CASH_AND_CASH_EQUIVALENTS": ["jppfs_cor:CashAndDeposits",
                                       "jpigp_cor:CashAndCashEquivalentsIFRS"],
         "INVENTORIES": ["jppfs_cor:Inventories", "jpigp_cor:InventoriesCAIFRS"],
+        # JGAAP filers break inventory out on the face BS; IFRS filers usually
+        # don't, so those land on MISSING (aggregate INVENTORIES still resolves).
+        "FINISHED_GOODS": ["jppfs_cor:FinishedGoods",
+                           "jppfs_cor:MerchandiseAndFinishedGoods",
+                           "jppfs_cor:Merchandise"],
+        "RAW_MATERIALS": ["jppfs_cor:RawMaterials",
+                          "jppfs_cor:RawMaterialsAndSupplies",
+                          "jppfs_cor:MerchandiseAndRawMaterials"],
+        "WORK_IN_PROCESS": ["jppfs_cor:WorkInProcess",
+                            "jppfs_cor:WorkInProcessAndSemifinishedGoods"],
         "PROPERTY_PLANT_AND_EQUIPMENT": ["jppfs_cor:PropertyPlantAndEquipment",
                                          "jpigp_cor:PropertyPlantAndEquipmentIFRS"],
         # parent-owners' equity (excludes NCI), vs TOTAL_EQUITY = NetAssets/Equity.
