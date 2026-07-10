@@ -2404,6 +2404,189 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
 
 
 # --------------------------------------------------------------------------- #
+# Compare against a pulled reference (offline) with fuzzy label matching
+# --------------------------------------------------------------------------- #
+def _norm_lbl(s):
+    return re.sub(r"[\s()\.\-_/、,，&]", "", s or "").upper()
+
+
+def fuzzy_match(user_label, candidates, is_geo):
+    """Pick the reference row whose label best matches the user's segment/geo label.
+    candidates: list of (label, value). Tries, in order: canonical region equality
+    (geo only), exact normalized string, substring either way, then difflib
+    similarity above a threshold. Returns (label, value, how) or None."""
+    import difflib
+    if not candidates:
+        return None
+    if is_geo:
+        uc = _canon_region(user_label)
+        for lab, val in candidates:
+            if _canon_region(lab) == uc:
+                return (lab, val, "region")
+    un = _norm_lbl(user_label)
+    for lab, val in candidates:
+        if _norm_lbl(lab) == un:
+            return (lab, val, "exact")
+    for lab, val in candidates:
+        ln = _norm_lbl(lab)
+        if ln and un and (ln in un or un in ln):
+            return (lab, val, "substring")
+    best, best_r = None, 0.0
+    for lab, val in candidates:
+        r = difflib.SequenceMatcher(None, un, _norm_lbl(lab)).ratio()
+        if r > best_r:
+            best, best_r = (lab, val), r
+    if best and best_r >= (0.7 if is_geo else 0.6):
+        return (best[0], best[1], f"fuzzy:{best_r:.2f}")
+    return None
+
+
+def _strip_seg_prefix(code):
+    return re.sub(r"^\d{4}Q\d_", "", code or "").strip()
+
+
+def compare_against_reference(data_dir: Path, ref_dir: Path, out_dir: Path,
+                              registry: dict, metric_map: dict, files_map: dict,
+                              mapping: dict = None):
+    """Reconcile the user's files against a previously pulled reference/ dump —
+    offline, no API calls — with fuzzy matching: financial_code via metric_map,
+    segment/geo labels via fuzzy_match(), values within the usual tolerances
+    (reference values are already in millions / per-share)."""
+    from collections import defaultdict
+    mapping = mapping or {}
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _read(fname):
+        for cand in (ref_dir / fname, ref_dir / (fname if fname.endswith(".csv")
+                                                 else fname + ".csv")):
+            if cand.exists():
+                with open(cand, encoding="utf-8-sig", newline="") as f:
+                    return list(csv.DictReader(f, delimiter=";"))
+        return []
+
+    ref_fa = {}                                   # (cid, cy, cq, canonical) -> value
+    for r in _read("FA.csv"):
+        try:
+            ref_fa[(r["company_id"].strip(), r["calendar_year"].strip(),
+                    r["calendar_quarter"].strip(), r["financial_code"].strip())] = \
+                float(r["financial_report_value"])
+        except (ValueError, KeyError, TypeError):
+            pass
+    ref_seg = {"Seg_Geo_Revenue": defaultdict(list),
+               "Seg_Seg_Revenue": defaultdict(list)}
+    for logical in ref_seg:
+        for r in _read(logical + ".csv"):
+            try:
+                v = float(r["financial_report_value"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            key = (r["company_id"].strip(), r["calendar_year"].strip(),
+                   r["calendar_quarter"].strip())
+            ref_seg[logical][key].append(
+                (_strip_seg_prefix(r.get("segment_code")), v))
+
+    def cmp(fv, ref, per_share):
+        if per_share:
+            return "MATCH" if abs(fv - ref) <= EPS_ABS_TOL else "MISMATCH"
+        if max(abs(fv), abs(ref)) < NEAR_ZERO:
+            return "MATCH" if abs(fv - ref) < NEAR_ZERO else "MISMATCH"
+        return ("MATCH" if abs(fv - ref) / max(abs(fv), abs(ref)) <= REL_TOL
+                else "MISMATCH")
+
+    results = []
+    for logical, fname in files_map.items():
+        fpath = resolve_data_file(data_dir, fname)
+        if not fpath.exists():
+            continue
+        is_seg = logical in SEG_FILES
+        is_geo = logical.startswith("Seg_Geo")
+        seg_key = "Seg_Geo_Revenue" if is_geo else "Seg_Seg_Revenue"
+        with open(fpath, encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f, delimiter=";"):
+                cid = (row.get("company_id") or "").strip()
+                cy = (row.get("calendar_year") or "").strip()
+                cq = (row.get("calendar_quarter") or "").strip()
+                code = (row.get("financial_code") or "").strip()
+                rec = {"file": logical, "company_id": cid,
+                       "company_name": (registry.get(cid, {}).get("name")
+                                        or mapping.get(cid, "")),
+                       "calendar_year": cy, "calendar_quarter": cq,
+                       "financial_code": code,
+                       "segment_code": (row.get("segment_code") or "").strip(),
+                       "file_value": row.get("financial_report_value", ""),
+                       "api_value_local": "", "api_value_millions": "",
+                       "status": "", "note": ""}
+                try:
+                    fv = float(str(rec["file_value"]).replace(",", ""))
+                except ValueError:
+                    rec["status"] = "BAD_FILE_VALUE"; results.append(rec); continue
+
+                if is_seg and logical.endswith("Operating_Income"):
+                    rec["status"] = "MISSING_IN_REFERENCE"
+                    rec["note"] = "reference covers revenue only"
+                    results.append(rec); continue
+
+                if is_seg:
+                    label = _strip_seg_prefix(rec["segment_code"])
+                    cand = ref_seg[seg_key].get((cid, cy, cq), [])
+                    m = fuzzy_match(label, cand, is_geo)
+                    if not m:
+                        rec["status"] = "MISSING_IN_REFERENCE"
+                        rec["note"] = (f"no reference label matched '{label}'"
+                                       if cand else "no reference rows for period")
+                        results.append(rec); continue
+                    ref_lab, ref_val, how = m
+                    rec["api_value_millions"] = round(ref_val, 3)
+                    rec["status"] = cmp(fv, ref_val, False)
+                    rec["note"] = f"matched '{ref_lab}' ({how})"
+                    results.append(rec); continue
+
+                # FA statement row
+                canonical = metric_map.get(code)
+                if is_derived_code(code, canonical):
+                    rec["status"] = "UNSUPPORTED_DERIVED"; results.append(rec); continue
+                if not canonical:
+                    rec["status"] = "NO_MAPPING"; results.append(rec); continue
+                ref_val = ref_fa.get((cid, cy, cq, canonical))
+                if ref_val is None:
+                    rec["status"] = "MISSING_IN_REFERENCE"
+                    rec["note"] = f"{canonical} not in reference for this period"
+                    results.append(rec); continue
+                per_share = CANONICAL.get(canonical, {}).get("per_share", False)
+                rec["api_value_millions"] = "" if per_share else round(ref_val, 3)
+                rec["api_value_local"] = ref_val if per_share else ""
+                rec["status"] = cmp(fv, ref_val, per_share)
+                rec["note"] = f"matched {canonical}"
+                results.append(rec)
+
+    cols = ["file", "company_id", "company_name", "calendar_year", "calendar_quarter",
+            "financial_code", "segment_code", "file_value", "api_value_local",
+            "api_value_millions", "status", "note"]
+    with open(out_dir / "verification_results.csv", "w", newline="",
+              encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols); w.writeheader()
+        for r in results:
+            w.writerow({k: r.get(k, "") for k in cols})
+    mism = [r for r in results if r["status"] == "MISMATCH"]
+    with open(out_dir / "mismatches.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols); w.writeheader()
+        for r in mism:
+            w.writerow({k: r.get(k, "") for k in cols})
+    from collections import Counter
+    counts = Counter(r["status"] for r in results)
+    print("\n=== Summary (offline vs reference, fuzzy-matched) ===")
+    for st, n in sorted(counts.items(), key=lambda x: -x[1]):
+        print(f"  {st:22} {n}")
+    print(f"\nFull results : {out_dir/'verification_results.csv'}")
+    print(f"Mismatches   : {out_dir/'mismatches.csv'}  ({len(mism)} rows)")
+    for r in mism[:50]:
+        print(f"  [{r['company_id']} {r['company_name']}] {r['financial_code']} "
+              f"{r['segment_code'] or ''} {r['calendar_year']}Q{r['calendar_quarter']}: "
+              f"file={r['file_value']} vs ref={r['api_value_millions']}  ({r['note']})")
+    return results
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 DEFAULT_FILES = {
@@ -2441,6 +2624,10 @@ def main():
                          "(US/TW fully, KR geographic; slower)")
     ap.add_argument("--dump-years", default="2019-2025",
                     help="year range for --dump, e.g. 2019-2025 or 2022-2025")
+    ap.add_argument("--reference", default=None,
+                    help="compare your --data-dir files against a pulled reference "
+                         "dir (offline, no API calls) with fuzzy label matching, "
+                         "e.g. --reference ./out/reference")
     args = ap.parse_args()
 
     cfg = Path(args.config_dir)
@@ -2459,6 +2646,11 @@ def main():
         lo, hi = (int(x) for x in args.dump_years.split("-"))
         dump_reference(Path(args.out_dir), registry, range(lo, hi + 1),
                        include_seg=args.dump_seg, seg_members=seg_members)
+        return
+    if args.reference:
+        compare_against_reference(Path(args.data_dir), Path(args.reference),
+                                  Path(args.out_dir), registry, metric_map,
+                                  DEFAULT_FILES, mapping)
         return
     run(Path(args.data_dir), Path(args.out_dir), args.compare_column,
         registry, metric_map, DEFAULT_FILES, seg_members, mapping, args.export)
