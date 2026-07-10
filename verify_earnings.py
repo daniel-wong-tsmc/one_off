@@ -1914,6 +1914,17 @@ SEG_FILES = {"Seg_Seg_Revenue", "Seg_Seg_Operating_Income",
              "Seg_Geo_Revenue", "Seg_Geo_Operating_Income"}
 
 
+def resolve_data_file(data_dir: Path, fname: str) -> Path:
+    """Locate a data file, tolerating the `.csv` suffix being present or absent
+    (the user's Seg_* files are named without an extension). Returns the path that
+    exists, else the `.csv` form for a clean 'not found' message."""
+    stem = fname[:-4] if fname.endswith(".csv") else fname
+    for cand in (data_dir / fname, data_dir / stem, data_dir / (stem + ".csv")):
+        if cand.exists():
+            return cand
+    return data_dir / fname
+
+
 def compare(file_val, api_local, per_share):
     if per_share:
         return ("MATCH" if abs(file_val - api_local) <= EPS_ABS_TOL else "MISMATCH",
@@ -1944,7 +1955,7 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
     # sources like OpenDART fetch only what's needed instead of all history)
     years_by_company = {}
     for logical, fname in files_map.items():
-        fpath = data_dir / fname
+        fpath = resolve_data_file(data_dir, fname)
         if not fpath.exists():
             continue
         with open(fpath, encoding="utf-8-sig", newline="") as f:
@@ -1965,7 +1976,7 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
         return series_cache[k]
 
     for logical, fname in files_map.items():
-        fpath = data_dir / fname
+        fpath = resolve_data_file(data_dir, fname)
         if not fpath.exists():
             print(f"  (skip {logical}: {fpath} not found)")
             continue
