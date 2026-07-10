@@ -386,6 +386,19 @@ class EdgarDimensional:
         _cache_put(ck, facts)
         return facts
 
+    def members(self, cik, axis_kw, years):
+        """All dimensional members present on the segment/geo axis (for enumerating
+        a company's disclosed segments/regions when dumping a reference)."""
+        out = set()
+        for acc, doc in self._filings(cik, years):
+            for tag, s, e, dims, val in self._facts(cik, acc, doc):
+                if tag not in (self.REV_TAGS + self.OPINC_TAGS):
+                    continue
+                for k, v in dims.items():
+                    if axis_kw in k:
+                        out.add(v)
+        return out
+
     def series(self, cik, tags, axis_kw, member, years):
         """Discrete-quarter (~90d) dimensional values keyed by (cal_year, cal_q).
         Matches the target axis+member, allowing only the standard segment
@@ -1425,6 +1438,25 @@ class MopsTwSource(Source):
                     out[(year, q)] = v
         return out
 
+    def all_labels(self, coid, years, is_geo):
+        """Region canons (地區別) or segment header names (部門資訊) this company
+        actually discloses, for enumerating a reference. Scans Q1–Q3 tables."""
+        labels = set()
+        for y in years:
+            for q in (1, 2, 3):
+                try:
+                    if is_geo:
+                        t = self._geo_table(coid, y, q)
+                        if t:
+                            labels |= set(t.keys())
+                    else:
+                        t = self._seg_table(coid, y, q)
+                        if t:
+                            labels |= set((t.get("discrete") or {}).keys())
+                except Exception:
+                    pass
+        return labels
+
     def _geo_quarter(self, coid, year, q, region):
         if q in (1, 2, 3):
             t = self._geo_table(coid, year, q)
@@ -1968,6 +2000,138 @@ def export_files(export_dir: Path, results: list, files_map: dict):
                             "financial_report_value": val})
 
 
+# common region canons to probe for markets whose geo auto-matches by name (KR/TW)
+_GEO_PROBE = ["US", "CN", "JP", "TW", "KR", "DE", "EU", "EMEA", "ASIA", "NA",
+              "LATAM", "HK", "SG", "IN", "VN", "ME", "AF", "OCEANIA", "OTHER"]
+
+
+def dump_segments(ref: Path, items, sources, edgar_dim, mops_tw, seg_members, yset):
+    """Enumerate disclosed geographic + business-segment revenue for each company
+    and stream to reference/Seg_Geo_Revenue.csv and reference/Seg_Seg_Revenue.csv.
+    US: all XBRL members on the geo/segment axes. TW: all 地區別 regions / 部門資訊
+    segments from the PDF book. KR: geographic regions by name-probe. JP and KR
+    business segments need per-company member names, so they're covered by the
+    row-driven verify path rather than enumerated here (noted in the console)."""
+    cols = ["company_id", "calendar_year", "calendar_quarter", "segment_code",
+            "financial_code", "financial_value", "financial_report_value"]
+    geo_f = open(ref / "Seg_Geo_Revenue.csv", "w", newline="", encoding="utf-8-sig")
+    seg_f = open(ref / "Seg_Seg_Revenue.csv", "w", newline="", encoding="utf-8-sig")
+    geo_w = csv.DictWriter(geo_f, fieldnames=cols, delimiter=";"); geo_w.writeheader()
+    seg_w = csv.DictWriter(seg_f, fieldnames=cols, delimiter=";"); seg_w.writeheader()
+
+    def emit(writer, cid, ser, label, code):
+        for (y, q), v in sorted(ser.items()):
+            if y in yset:
+                writer.writerow({"company_id": cid, "calendar_year": y,
+                                 "calendar_quarter": q,
+                                 "segment_code": f"{y}Q{q}_{label}",
+                                 "financial_code": code, "financial_value": "",
+                                 "financial_report_value": round(v / 1e6, 4)})
+
+    for cid, comp in items:
+        mk, api, fye = comp["market"], comp["api_id"], comp["fye_month"]
+        if mk == "cn":
+            continue                       # China seg/geo is semi-annual only
+        print(f"  seg/geo {cid} {mk}:{api} {comp['name'][:28]}", flush=True)
+        try:
+            if mk == "us":
+                cik = sources["us"]._resolve_cik(api)
+                if not cik:
+                    continue
+                for member in edgar_dim.members(cik, "Geograph", yset):
+                    emit(geo_w, cid, edgar_dim.series(
+                        cik, EdgarDimensional.REV_TAGS, "Geograph", member, yset),
+                        member, "GEO_REVENUE")
+                for member in edgar_dim.members(cik, "Segment", yset):
+                    emit(seg_w, cid, edgar_dim.series(
+                        cik, EdgarDimensional.REV_TAGS, "Segment", member, yset),
+                        member, "SEG_REVENUE")
+            elif mk == "tw":
+                for region in mops_tw.all_labels(api, sorted(yset), is_geo=True):
+                    emit(geo_w, cid, mops_tw.segment_quarterly(
+                        api, fye, yset, region, "revenue", True), region, "GEO_REVENUE")
+                for seg in mops_tw.all_labels(api, sorted(yset), is_geo=False):
+                    emit(seg_w, cid, mops_tw.segment_quarterly(
+                        api, fye, yset, seg, "revenue", False), seg, "SEG_REVENUE")
+            elif mk == "kr":
+                for region in _GEO_PROBE:
+                    ser = sources["kr"].segment_quarterly(
+                        api, fye, yset, region, "revenue", True)
+                    if ser:
+                        emit(geo_w, cid, ser, region, "GEO_REVENUE")
+            # jp: reportable-segment members are per-company; use the verify path
+        except Exception as e:
+            print(f"     ! {str(e)[:70]}", flush=True)
+        geo_f.flush(); seg_f.flush()
+    geo_f.close(); seg_f.close()
+    print(f"\nSegment/geo reference -> {ref/'Seg_Geo_Revenue.csv'}, "
+          f"{ref/'Seg_Seg_Revenue.csv'}", flush=True)
+
+
+def dump_reference(out_dir: Path, registry: dict, years, include_seg: bool = False,
+                   seg_members: dict = None):
+    """Pull a STANDALONE reference of the as-filed figures for every configured
+    company (independent of any input file) and write it in the user's own CSV
+    schema, so a file can be diffed/fuzzy-matched against it. Enumerates every
+    statement metric each market's source supports, across `years`; with
+    include_seg, also enumerates disclosed geographic + business-segment revenue
+    (US/JP/KR/TW; China excluded — semi-annual only). financial_value (FX->USD) is
+    left blank. Progress is printed per company; results stream to disk so a long
+    (hours) run leaves partial output if interrupted."""
+    import sys
+    sources = {s.market: s for s in
+               (EdgarSource(), OpenDartSource(), FinMindSource(), JapanSource(),
+                AKShareSource())}
+    edgar_dim = EdgarDimensional(sources["us"])
+    mops_tw = MopsTwSource()
+    seg_members = seg_members or {}
+    ref = out_dir / "reference"
+    ref.mkdir(parents=True, exist_ok=True)
+    yset = set(int(y) for y in years)
+
+    FA_COLS = ["company_id", "fiscal_year", "fiscal_quarter", "calendar_year",
+               "calendar_quarter", "financial_code", "financial_value",
+               "financial_report_value"]
+    fa = open(ref / "FA.csv", "w", newline="", encoding="utf-8-sig")
+    faw = csv.DictWriter(fa, fieldnames=FA_COLS, delimiter=";"); faw.writeheader()
+
+    items = sorted(registry.items(),
+                   key=lambda kv: ({"us": 0, "tw": 1, "kr": 2, "cn": 3, "jp": 4}
+                                   .get(kv[1]["market"], 9), kv[0]))
+    n = 0
+    for cid, comp in items:
+        src = sources.get(comp["market"])
+        if not src or not getattr(src, "available", False):
+            continue
+        n += 1
+        print(f"[{n}] statements {cid} {comp['market']}:{comp['api_id']} "
+              f"{comp['name'][:32]}", flush=True)
+        for metric in sorted(getattr(src, "metric_map", {})):
+            if metric not in CANONICAL:
+                continue
+            try:
+                series = src.quarterly(comp["api_id"], metric, comp["fye_month"],
+                                       years=yset)
+            except Exception as e:
+                print(f"     ! {metric}: {str(e)[:60]}", flush=True); continue
+            ps = CANONICAL[metric]["per_share"]
+            for (y, q), v in sorted(series.items()):
+                if y not in yset:
+                    continue
+                faw.writerow({"company_id": cid, "fiscal_year": "",
+                              "fiscal_quarter": "", "calendar_year": y,
+                              "calendar_quarter": q, "financial_code": metric,
+                              "financial_value": "",
+                              "financial_report_value": round(v if ps else v / 1e6, 4)})
+        fa.flush()
+    fa.close()
+    print(f"\nStatements reference -> {ref/'FA.csv'}", flush=True)
+
+    if include_seg:
+        dump_segments(ref, [kv for kv in items], sources, edgar_dim, mops_tw,
+                      seg_members, yset)
+
+
 def run(data_dir: Path, out_dir: Path, compare_col: str,
         registry: dict, metric_map: dict, files_map: dict, seg_members: dict = None,
         mapping: dict = None, export: bool = False):
@@ -2269,6 +2433,14 @@ def main():
     ap.add_argument("--export", action="store_true",
                     help="also write the API-fetched values in your own file schema "
                          "to <out-dir>/export/, for diffing against your originals")
+    ap.add_argument("--dump", action="store_true",
+                    help="pull a STANDALONE reference of all configured companies "
+                         "(no input file needed) to <out-dir>/reference/. Slow.")
+    ap.add_argument("--dump-seg", action="store_true",
+                    help="with --dump, also enumerate segment/geographic revenue "
+                         "(US/TW fully, KR geographic; slower)")
+    ap.add_argument("--dump-years", default="2019-2025",
+                    help="year range for --dump, e.g. 2019-2025 or 2022-2025")
     args = ap.parse_args()
 
     cfg = Path(args.config_dir)
@@ -2283,6 +2455,11 @@ def main():
     mapping = load_company_mapping(find_mapping_file(Path(args.data_dir), args.mapping_file))
     if not registry:
         print("WARNING: empty company_registry.csv — every row will be COMPANY_NOT_CONFIGURED")
+    if args.dump:
+        lo, hi = (int(x) for x in args.dump_years.split("-"))
+        dump_reference(Path(args.out_dir), registry, range(lo, hi + 1),
+                       include_seg=args.dump_seg, seg_members=seg_members)
+        return
     run(Path(args.data_dir), Path(args.out_dir), args.compare_column,
         registry, metric_map, DEFAULT_FILES, seg_members, mapping, args.export)
 
