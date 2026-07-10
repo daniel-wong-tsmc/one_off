@@ -73,8 +73,13 @@ company_id,market,api_id,fye_month,name
 195,us,MGA,12,Magna International Inc
 200,us,FLEX,3,Flex Ltd
 202,us,APH,12,Amphenol Corp
+# ---- China A-shares (Eastmoney F10 / AKShare data) — statements only, no seg/geo yet ----
+131,cn,688213,12,SmartSens Technology Co Ltd
+143,cn,002156,12,TongFu Microelectronics Co Ltd
+185,cn,002594,12,BYD Company Ltd (Shenzhen A-share)
+193,cn,600104,12,SAIC Motor Corp Ltd
 #
-# ---------- NOT CONFIGURED: no free data source in this tool (30 companies) ----------
+# ---------- NOT CONFIGURED: no free data source in this tool (26 companies) ----------
 # They report COMPANY_NOT_CONFIGURED. Grouped by why:
 #  * Europe (EUR) — no source:
 #      100 Siemens EDA
@@ -88,14 +93,10 @@ company_id,market,api_id,fye_month,name
 #      192 Daimler Truck Holding AG
 #      194 Continental AG
 #      199 Merck KGaA
-#  * China / Hong Kong — out of scope:
-#      131 SmartSens
-#      140 Xiaomi
-#      143 TongFu Microelectronics
-#      156 Baidu
-#      160 Alibaba
-#      185 BYD
-#      193 SAIC Motor
+#  * Hong Kong / ADR only (no mainland A-share; HK reports half-yearly, not quarterly):
+#      140 Xiaomi (HK 1810)
+#      156 Baidu (US ADR / HK 9888)
+#      160 Alibaba (US ADR / HK 9988)
 #  * Foreign ADR / 20-F filer — no us-gaap quarterly in EDGAR:
 #      129 Silicon Motion
 #      146 Tower Semiconductor

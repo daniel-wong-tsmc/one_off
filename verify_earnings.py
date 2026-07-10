@@ -1003,6 +1003,97 @@ class FinMindSource(Source):
         return out
 
 
+# ---- China A-shares: Eastmoney F10 (the data AKShare wraps) ---------------- #
+class AKShareSource(Source):
+    """China A-share quarterly statements via the Eastmoney F10 abstract endpoints
+    (`RPT_DMSK_FN_INCOME` / `RPT_DMSK_FN_BALANCE`) — the same data AKShare wraps,
+    called directly with stdlib so the tool stays dependency-light (AKShare needs
+    pandas + a build-fragile antlr4/jsonpath chain). Chinese income statements are
+    filed **year-to-date cumulative** (Q1=3M, H1=6M, 9M, FY), so flow metrics are
+    de-cumulated into discrete quarters; balance-sheet items are point-in-time.
+    Values are full RMB. Segment/geo (分部/地区) is not covered here — it lives in the
+    annual-report notes on cninfo (巨潮), which would need PDF parsing like Taiwan."""
+    market = "cn"
+    EM = "https://datacenter.eastmoney.com/securities/api/data/v1/get"
+    INC, BAL = "RPT_DMSK_FN_INCOME", "RPT_DMSK_FN_BALANCE"
+    metric_map = {   # canonical -> (reportName, Eastmoney field)
+        "REVENUE":          (INC, "TOTAL_OPERATE_INCOME"),   # 营业总收入
+        "COGS":             (INC, "OPERATE_COST"),           # 营业成本
+        "OPERATING_INCOME": (INC, "OPERATE_PROFIT"),         # 营业利润
+        "PRE_TAX_INCOME":   (INC, "TOTAL_PROFIT"),           # 利润总额
+        "NET_INCOME":       (INC, "PARENT_NETPROFIT"),       # 归母净利润
+        "TOTAL_ASSETS":       (BAL, "TOTAL_ASSETS"),         # 资产总计
+        "TOTAL_LIABILITIES":  (BAL, "TOTAL_LIABILITIES"),    # 负债合计
+        "TOTAL_EQUITY":       (BAL, "TOTAL_EQUITY"),         # 股东权益合计
+        "ACCOUNTS_PAYABLE":   (BAL, "ACCOUNTS_PAYABLE"),     # 应付账款
+    }
+    available = True
+
+    @staticmethod
+    def _secucode(api_id):
+        s = api_id.strip().upper()
+        if "." in s:
+            return s
+        if s[0] == "6":
+            return s + ".SH"        # Shanghai
+        if s[0] in "489":
+            return s + ".BJ"        # Beijing (also 8/4 boards)
+        return s + ".SZ"            # Shenzhen (0/3)
+
+    def _fetch(self, report, secucode):
+        ck = f"akshare_em_{report}_{secucode}"
+        c = _cache_get(ck)
+        if c is not None:
+            return c
+        q = {"reportName": report, "columns": "ALL", "source": "HSF10",
+             "client": "PC", "filter": f'(SECUCODE="{secucode}")',
+             "pageNumber": "1", "pageSize": "300",
+             "sortColumns": "REPORT_DATE", "sortTypes": "-1"}
+        rows = []
+        try:
+            r = SESSION.get(self.EM + "?" + urllib.parse.urlencode(q),
+                            headers={"User-Agent": "Mozilla/5.0",
+                                     "Referer": "https://emweb.securities.eastmoney.com/"},
+                            timeout=60)
+            rows = (r.json().get("result") or {}).get("data") or []
+        except Exception:
+            rows = []
+        _cache_put(ck, rows)
+        return rows
+
+    def quarterly(self, api_id, metric, fye_month=12, years=None):
+        report, field = self.metric_map[metric]
+        rows = self._fetch(report, self._secucode(api_id))
+        vals = {}
+        for r in rows:
+            rd, v = r.get("REPORT_DATE"), r.get(field)
+            if not rd or v is None:
+                continue
+            try:
+                vals[rd[:10]] = float(v)
+            except (TypeError, ValueError):
+                pass
+        if CANONICAL[metric]["kind"] == "stock":
+            return {cal_key_from_date(d): v for d, v in vals.items()}
+        # flow: YTD cumulative -> de-cumulate within each calendar year
+        from collections import defaultdict
+        by_year = defaultdict(dict)
+        for d, v in vals.items():
+            by_year[int(d[:4])][quarter_of(int(d[5:7]))] = (d, v)
+        out = {}
+        for qm in by_year.values():
+            for q in (1, 2, 3, 4):
+                if q not in qm:
+                    continue
+                d, cum = qm[q]
+                if q == 1:
+                    out[cal_key_from_date(d)] = cum
+                elif (q - 1) in qm:
+                    out[cal_key_from_date(d)] = cum - qm[q - 1][1]
+                # else: prior quarter missing -> can't de-cumulate, skip
+        return out
+
+
 # ---- Taiwan segment/geo: MOPS financial-report book (PDF notes) ------------ #
 # TW segment & geographic revenue is disclosed only in the notes to the financial
 # statements — the 營業收入 disaggregation (地區別, revenue by region) and the
@@ -1766,7 +1857,8 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
         registry: dict, metric_map: dict, files_map: dict, seg_members: dict = None,
         mapping: dict = None):
     sources = {s.market: s for s in
-               (EdgarSource(), OpenDartSource(), FinMindSource(), JapanSource())}
+               (EdgarSource(), OpenDartSource(), FinMindSource(), JapanSource(),
+                AKShareSource())}
     edgar_dim = EdgarDimensional(sources["us"])
     mops_tw = MopsTwSource()
     seg_members = seg_members or {}
