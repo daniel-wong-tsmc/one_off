@@ -1,17 +1,112 @@
 company_id,market,api_id,fye_month,name
-# Map each company_id (from your company_id_mapping file) to the market and the
-# API identifier used by that market's source:
-#   market=us -> api_id = ticker or CIK          (SEC EDGAR)
-#   market=kr -> api_id = 6-digit KRX stock code  (OpenDART)
-#   market=tw -> api_id = TWSE/TPEx stock code     (FinMind)
-#   market=jp -> api_id = 4- or 5-digit sec code   (EDINET; annual-only in v1)
-# fye_month = fiscal-year-end month (default 12). Set for non-December filers.
-#
-# Example (TSMC is company_id 1 in the sample mapping you shared):
+# ============================================================
+# Auto-built from your 92-company list.
+# api_id verified against: TW=FinMind TaiwanStockInfo, US=EDGAR tickers, KR=OpenDART.
+# fye_month: JP mostly March (3), AGC=12; TW/KR/US=12 (US EDGAR ignores it, JP uses it).
+# CAVEATS on specific rows:
+#   106 Hitachi High-Tech, 162 NuFlare: delisted -> EDINET has historical filings only.
+#   107 Kokusai Electric: IPO Oct-2023 -> recent quarters only.
+#   121 SMC: your list said 'SMC Taiwan' (JPY) -> mapped to the JP parent (6273).
+#   108 Veeco / 115 Nordson / 122 Linde: your list named the TW branch -> mapped to the
+#       US-listed PARENT (consolidated 10-K). Remove if you meant the local entity only.
+# ============================================================
 1,tw,2330,12,Taiwan Semiconductor Manufacturing Co Ltd
-# --- fill in the rest of your companies below, e.g. the four we validated: ---
-# <id>,us,QRVO,3,Qorvo Inc
-# <id>,tw,6196,12,Marketech International Corp
-# <id>,tw,2353,12,Acer Inc
-# <id>,kr,000990,12,DB HiTek Co Ltd
-# <id>,jp,6526,3,Socionext Inc
+37,tw,1303,12,Nan Ya Plastics Corp
+103,tw,5434,12,Topco Scientific Co Ltd
+104,tw,6196,12,Marketech International Corp
+109,tw,3374,12,Xintec Inc
+117,tw,1503,12,Shihlin Electric & Engineering Corp
+118,tw,2338,12,Taiwan Mask Corp
+120,tw,2412,12,Chunghwa Telecom Co Ltd
+123,tw,6510,12,Chunghwa Precision Test Tech Co Ltd
+125,tw,3680,12,Gudeng Precision Industrial Co Ltd
+126,tw,2379,12,Realtek Semiconductor Corp
+132,tw,6732,12,Sensortek Technology Corp
+136,tw,2357,12,ASUSTeK Computer Inc
+137,tw,2356,12,Inventec Corp
+138,tw,4938,12,Pegatron Corp
+141,tw,2449,12,King Yuan Electronics Co Ltd
+142,tw,6239,12,Powertech Technology Inc
+145,tw,6770,12,Powerchip Semiconductor Manufacturing Corp
+147,tw,5347,12,Vanguard International Semiconductor Corp
+152,tw,3034,12,Novatek Microelectronics Corp
+158,tw,2353,12,Acer Inc
+198,tw,3532,12,Formosa Sumco Technology Corp
+201,tw,2317,12,Hon Hai Precision Industry Co Ltd
+81,jp,7203,3,Toyota Motor Corp
+106,jp,8036,3,Hitachi High-Tech Corp
+107,jp,6525,3,Kokusai Electric Corp
+113,jp,7729,3,Tokyo Seimitsu Co Ltd (Accretech)
+114,jp,1979,3,Taikisha Ltd
+116,jp,4182,3,Mitsubishi Gas Chemical Co Inc
+119,jp,5201,12,AGC Inc
+121,jp,6273,3,SMC Corp
+154,jp,6526,3,Socionext Inc
+162,jp,6256,3,NuFlare Technology Inc
+182,jp,7267,3,Honda Motor Co Ltd
+184,jp,7201,3,Nissan Motor Co Ltd
+196,jp,7259,3,Aisin Corp
+197,jp,6752,3,Panasonic Holdings Corp
+144,kr,000990,12,DB HiTek Co Ltd
+150,kr,108320,12,LX Semicon Co Ltd
+159,kr,200710,12,ADTechnology Co Ltd
+183,kr,005380,12,Hyundai Motor Co
+102,us,JBL,8,Jabil Inc
+108,us,VECO,12,Veeco Instruments Inc
+112,us,BRKR,12,Bruker Corp
+115,us,NDSN,10,Nordson Corp
+122,us,LIN,12,Linde plc
+124,us,MDT,4,Medtronic plc
+127,us,SYNA,6,Synaptics Inc
+128,us,SLAB,12,Silicon Laboratories Inc
+130,us,SITM,12,SiTime Corp
+133,us,DELL,1,Dell Technologies Inc
+134,us,HPE,10,Hewlett Packard Enterprise Co
+149,us,ON,12,ON Semiconductor Corp (onsemi)
+151,us,CSCO,7,Cisco Systems Inc
+153,us,SWKS,9,Skyworks Solutions Inc
+155,us,STX,6,Seagate Technology Holdings plc
+157,us,QRVO,3,Qorvo Inc
+179,us,F,12,Ford Motor Co
+180,us,GM,12,General Motors Co
+190,us,MBLY,12,Mobileye Global Inc
+195,us,MGA,12,Magna International Inc
+200,us,FLEX,3,Flex Ltd
+202,us,APH,12,Amphenol Corp
+#
+# ---------- NOT CONFIGURED: no free data source in this tool (30 companies) ----------
+# They report COMPANY_NOT_CONFIGURED. Grouped by why:
+#  * Europe (EUR) — no source:
+#      100 Siemens EDA
+#      110 Carl Zeiss AG
+#      163 Robert Bosch GmbH
+#      176 Volkswagen AG
+#      177 Mercedes-Benz Group AG
+#      178 Stellantis NV
+#      181 BMW AG
+#      191 Soitec SA
+#      192 Daimler Truck Holding AG
+#      194 Continental AG
+#      199 Merck KGaA
+#  * China / Hong Kong — out of scope:
+#      131 SmartSens
+#      140 Xiaomi
+#      143 TongFu Microelectronics
+#      156 Baidu
+#      160 Alibaba
+#      185 BYD
+#      193 SAIC Motor
+#  * Foreign ADR / 20-F filer — no us-gaap quarterly in EDGAR:
+#      129 Silicon Motion
+#      146 Tower Semiconductor
+#      186 Li Auto
+#      187 NIO
+#      188 XPeng
+#      189 Arm Holdings
+#  * Private / branch / delisted / non-EDGAR:
+#      101 ABB Taiwan
+#      135 Lenovo
+#      148 X-FAB
+#      164 Bitmain
+#      165 InvenSense
+#      203 Hua Hong / HHGrace
