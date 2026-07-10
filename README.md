@@ -45,8 +45,11 @@ a name can't be turned into a KRX/TWSE/sec code reliably, so you still fill in
 ## Run
 
 ```bash
-# your files live in ./data (FA.csv, Seg_*.csv). Filenames configurable in code.
+# your files live in ./data (FA.csv, Seg_* — a .csv suffix is optional).
 python verify_earnings.py --data-dir ./data --out-dir ./out
+
+# also write the API values back in YOUR file schema (to diff against your files):
+python verify_earnings.py --data-dir ./data --out-dir ./out --export
 
 # quick live check against 6 known-good companies (US/KR/TW/JP + TSMC & Acer TW seg/geo):
 python verify_earnings.py --self-test
@@ -56,6 +59,12 @@ Outputs:
 - `out/verification_results.csv` — every row with a status.
 - `out/mismatches.csv` — only the rows that disagree.
 - console — a status summary and the list of mismatches.
+- `out/export/` (with `--export`) — the **API-fetched values in your own CSV schema**
+  (one file per input file). `financial_report_value` is filled from the filings
+  (millions of local currency; per-share direct); `financial_value` (your FX→USD
+  column) is left blank — we can't reproduce your conversion — and cells are blank
+  wherever the API has no value (derived codes, unconfigured companies, or figures a
+  market doesn't disclose). Diff it against your originals to see every difference.
 
 ## What it compares (assumptions — please confirm against your data)
 

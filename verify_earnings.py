@@ -1937,9 +1937,40 @@ def compare(file_val, api_local, per_share):
     return ("MATCH" if ok else "MISMATCH", api_m)
 
 
+def export_files(export_dir: Path, results: list, files_map: dict):
+    """Write the API-fetched values back out in the user's own CSV schema (one file
+    per input file, ';'-delimited), so they can diff it against their originals.
+    `financial_report_value` holds the as-filed API value (millions of local
+    currency; per-share direct); `financial_value` is left blank (their FX-to-USD
+    column can't be reproduced without their conversion method)."""
+    export_dir.mkdir(parents=True, exist_ok=True)
+    FA_COLS = ["company_id", "fiscal_year", "fiscal_quarter", "calendar_year",
+               "calendar_quarter", "financial_code", "financial_value",
+               "financial_report_value"]
+    SEG_COLS = ["company_id", "calendar_year", "calendar_quarter", "segment_code",
+                "financial_code", "financial_value", "financial_report_value"]
+    for logical, fname in files_map.items():
+        rows = [r for r in results if r["file"] == logical]
+        if not rows:
+            continue
+        cols = SEG_COLS if logical in SEG_FILES else FA_COLS
+        out_name = fname if fname.endswith(".csv") else fname + ".csv"
+        with open(export_dir / out_name, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=cols, delimiter=";")
+            w.writeheader()
+            for r in rows:
+                val = r.get("api_value_millions")
+                if val == "" or val is None:      # per-share metrics carry local
+                    val = r.get("api_value_local", "")
+                w.writerow({**{c: "" for c in cols},
+                            **{c: r.get(c, "") for c in cols if c in r},
+                            "financial_value": "",
+                            "financial_report_value": val})
+
+
 def run(data_dir: Path, out_dir: Path, compare_col: str,
         registry: dict, metric_map: dict, files_map: dict, seg_members: dict = None,
-        mapping: dict = None):
+        mapping: dict = None, export: bool = False):
     sources = {s.market: s for s in
                (EdgarSource(), OpenDartSource(), FinMindSource(), JapanSource(),
                 AKShareSource())}
@@ -1988,6 +2019,8 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
                 cq = (row.get("calendar_quarter") or "").strip()
                 code = (row.get("financial_code") or "").strip()
                 rec = {"file": logical, "company_id": cid,
+                       "fiscal_year": (row.get("fiscal_year") or "").strip(),
+                       "fiscal_quarter": (row.get("fiscal_quarter") or "").strip(),
                        "calendar_year": cy, "calendar_quarter": cq,
                        "financial_code": code,
                        "segment_code": (row.get("segment_code") or "").strip(),
@@ -2173,6 +2206,14 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
         for r in mism:
             w.writerow({k: r.get(k, "") for k in cols})
 
+    # optional export: the API-fetched values written into YOUR file schema, so you
+    # can diff it against your own files. financial_report_value = the as-filed value
+    # (millions of local currency; per-share direct); financial_value (your FX-to-USD
+    # column) is left blank — we can't reproduce your conversion. Blank where the API
+    # has no value (derived code, unconfigured company, or not disclosed).
+    if export:
+        export_files(out_dir / "export", results, files_map)
+
     # console summary
     from collections import Counter
     counts = Counter(r["status"] for r in results)
@@ -2181,6 +2222,8 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
         print(f"  {st:22} {n}")
     print(f"\nFull results : {all_csv}")
     print(f"Mismatches   : {mm_csv}  ({len(mism)} rows)")
+    if export:
+        print(f"Export (your schema, API values): {out_dir / 'export'}/")
     if mism:
         print("\n=== MISMATCHES (company / metric / period) ===")
         for r in mism:
@@ -2223,6 +2266,9 @@ def main():
                          "flags ids missing from company_registry.csv")
     ap.add_argument("--self-test", action="store_true",
                     help="run live against the 6 validated companies in sample_data/")
+    ap.add_argument("--export", action="store_true",
+                    help="also write the API-fetched values in your own file schema "
+                         "to <out-dir>/export/, for diffing against your originals")
     args = ap.parse_args()
 
     cfg = Path(args.config_dir)
@@ -2238,7 +2284,7 @@ def main():
     if not registry:
         print("WARNING: empty company_registry.csv — every row will be COMPANY_NOT_CONFIGURED")
     run(Path(args.data_dir), Path(args.out_dir), args.compare_column,
-        registry, metric_map, DEFAULT_FILES, seg_members, mapping)
+        registry, metric_map, DEFAULT_FILES, seg_members, mapping, args.export)
 
 
 if __name__ == "__main__":
