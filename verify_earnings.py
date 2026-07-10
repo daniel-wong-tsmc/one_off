@@ -392,12 +392,22 @@ class EdgarSource(Source):
             elif 350 <= days <= 380:
                 annuals[e] = float(x["val"])
         out = {k: v[0] for k, v in quarters.items()}
-        # derive Q4 = FY - (the three quarters ending within the prior ~12 months)
+        # Q4: when the filer actually files a discrete "three months ended
+        # [FY-end]" frame (Dell, Flex do), that as-reported value is already in
+        # `quarters` — keep it. Only DERIVE Q4 = full-year − (Q1+Q2+Q3) when no
+        # discrete Q4 exists. Deriving over an as-filed Q4 was the bug: the annual
+        # can carry a different vintage (10-K vs proxy) or a different measure
+        # (total net income vs attributable-to-parent) than the quarters, so
+        # FY − 9M matched neither (e.g. Dell FY2025 net income $1,533M as-filed
+        # vs $1,517M derived; Flex FY2022 revenue $6,851M vs $5,443M).
         for e_annual, ann_val in annuals.items():
+            q4_key = cal_key_from_date(e_annual.isoformat())
+            if q4_key in quarters:          # discrete Q4 filed -> don't overwrite
+                continue
             sub = [v for (k, (v, e)) in quarters.items()
                    if 0 < (e_annual - e).days <= 285]
             if len(sub) == 3:
-                out[cal_key_from_date(e_annual.isoformat())] = ann_val - sum(sub)
+                out[q4_key] = ann_val - sum(sub)
         # YTD-ladder fallback: many filers report an income item only as
         # year-to-date cumulatives in their 10-Qs (Q1 ~90d, then ~180/270/365d,
         # all sharing one fiscal-year start) instead of discrete quarters. Group
