@@ -141,6 +141,25 @@ Outputs:
 | `SOURCE_UNAVAILABLE` | key missing for that market |
 | `BAD_FILE_VALUE` / `ERROR` | unparseable value / fetch error |
 
+### Restated vs as-filed periods (EDGAR multi-frame)
+
+A company can report the **same quarter under two different figures**: the value
+in its original filing, and a later restated value (a spin-off / discontinued-
+operations reclass, a prior-period error correction, …). EDGAR keeps both. When
+this happens the tool now pulls **every distinct vintage** for that period and
+counts a `MATCH` if your file agrees with **any** of them — so a file holding the
+as-originally-filed number isn't flagged as a `MISMATCH` just because EDGAR's
+latest frame is the restated one (or vice versa). The `note` column lists all the
+vintages and says which one your value matched (or "matches none" on a genuine
+`MISMATCH`), and `api_value_local` shows the vintage that matched.
+
+Example — **Dell CY2021Q3 COGS** (VMware spun off Nov 1 2021): `$20,335M` as
+originally filed (incl. VMware) and `$20,890M` as later restated to continuing
+operations. A file with either value now reconciles as `MATCH`. Revenue likewise
+carries `$28,394M` (as-filed) and `$26,424M` (restated). Only directly-filed
+figures (discrete quarters, point-in-time balances) carry vintages this way;
+derived Q4/YTD-ladder values use the single latest frame.
+
 ## Known limitations (v1)
 
 - **Japan quarterly coverage is split across two sources**, merged

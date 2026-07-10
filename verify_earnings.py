@@ -221,6 +221,16 @@ class Source:
         of calendar years actually needed (lets per-year sources fetch less)."""
         raise NotImplementedError
 
+    def frames(self, api_id: str, metric: str, fye_month: int = 12,
+               years=None) -> dict:
+        """Optional: {(cal_year, cal_q): [distinct as-reported values]} for
+        periods a source discloses under MORE THAN ONE vintage — e.g. EDGAR keeps
+        both the as-originally-filed figure and later restatements of the same
+        quarter (a spin-off/discontinued-operations reclass, a prior-period error
+        correction, …). Only periods with >1 distinct value are returned. Default:
+        none, so `quarterly()`'s single value is the only vintage."""
+        return {}
+
 
 # ---- US: SEC EDGAR -------------------------------------------------------- #
 class EdgarSource(Source):
@@ -377,6 +387,61 @@ class EdgarSource(Source):
                 if qi - 1 == prev_q:
                     out.setdefault(cal_key_from_date(e.isoformat()), v - prev_v)
                 prev_v, prev_q = v, qi
+        return out
+
+    def frames(self, api_id, metric, fye_month=12, years=None):
+        """All distinct as-reported vintages of each directly-filed period, so a
+        restated quarter surfaces alongside the as-originally-filed one instead of
+        the latest silently overwriting it. E.g. Dell CY2021Q3 COGS: $20,335M as
+        first filed (incl. VMware) and $20,890M as later restated to continuing
+        operations after the Nov-2021 spin-off — both are returned. Covers only
+        directly-reported facts (~90d discrete quarters and point-in-time balances)
+        — the quarter where a company files two figures; derived Q4/YTD-ladder
+        values aren't 'vintages' and are left to quarterly()."""
+        cik = self._resolve_cik(api_id)
+        if not cik:
+            return {}
+        per_share = CANONICAL[metric]["per_share"]
+        kind = CANONICAL[metric]["kind"]
+        unit = "USD/shares" if per_share else "USD"
+        facts = []
+        for tag in self.metric_map[metric]:      # same tag quarterly() settled on
+            d = self._concept(cik, tag)
+            if d and d.get("units", {}).get(unit):
+                facts = d["units"][unit]
+                break
+        if not facts:
+            return {}
+        from collections import defaultdict
+        vals = defaultdict(list)                  # (cal_y,cal_q) -> [values, in file order]
+        for x in facts:
+            if not x.get("end"):
+                continue
+            if kind == "stock":
+                if not x.get("start"):
+                    vals[cal_key_from_date(x["end"])].append(float(x["val"]))
+                else:
+                    s = datetime.date.fromisoformat(x["start"])
+                    e = datetime.date.fromisoformat(x["end"])
+                    if (e - s).days <= 5:
+                        vals[cal_key_from_date(x["end"])].append(float(x["val"]))
+            else:
+                if not x.get("start"):
+                    continue
+                s = datetime.date.fromisoformat(x["start"])
+                e = datetime.date.fromisoformat(x["end"])
+                if 80 <= (e - s).days <= 100:
+                    vals[cal_key_from_date(x["end"])].append(float(x["val"]))
+        out = {}
+        for k, lst in vals.items():
+            seen, distinct = set(), []
+            for v in lst:
+                r = round(v, 2)                   # collapse exact repeats across filings
+                if r not in seen:
+                    seen.add(r)
+                    distinct.append(v)
+            if len(distinct) > 1:                 # only ambiguous periods matter
+                out[k] = distinct
         return out
 
 
@@ -2138,6 +2203,24 @@ def compare(file_val, api_local, per_share):
     return ("MATCH" if ok else "MISMATCH", api_m)
 
 
+def compare_multi(file_val, api_locals, per_share):
+    """Compare the file value against several candidate API values — the distinct
+    vintages a source reports for one period (EDGAR as-filed vs restated). MATCH
+    if the file agrees with ANY vintage (each is a figure the company actually
+    filed, so agreeing with either is correct); otherwise MISMATCH reported
+    against the primary (first) candidate, which is quarterly()'s latest frame.
+    Returns (status, matched_local, api_millions, matched_flag)."""
+    fallback = None
+    for a in api_locals:
+        status, api_m = compare(file_val, a, per_share)
+        if status == "MATCH":
+            return "MATCH", a, api_m, True
+        if fallback is None:
+            fallback = (status, a, api_m)
+    status, a, api_m = fallback
+    return status, a, api_m, False
+
+
 def export_files(export_dir: Path, results: list, files_map: dict):
     """Write the API-fetched values back out in the user's own CSV schema (one file
     per input file, ';'-delimited), so they can diff it against their originals.
@@ -2330,6 +2413,7 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
                     years_by_company.setdefault(cid, set()).add(int(cy))
 
     series_cache = {}   # (market, api_id, metric) -> {(y,q): value}
+    frames_cache = {}   # (market, api_id, metric) -> {(y,q): [distinct vintages]}
 
     def get_series(src, comp, cid, metric):
         k = (comp["market"], comp["api_id"], metric)
@@ -2338,6 +2422,19 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
                 comp["api_id"], metric, comp["fye_month"],
                 years=years_by_company.get(cid))
         return series_cache[k]
+
+    def get_frames(src, comp, cid, metric):
+        """Distinct as-reported vintages per period (EDGAR as-filed vs restated);
+        {} for sources that expose only one value."""
+        k = (comp["market"], comp["api_id"], metric)
+        if k not in frames_cache:
+            try:
+                frames_cache[k] = src.frames(
+                    comp["api_id"], metric, comp["fye_month"],
+                    years=years_by_company.get(cid))
+            except Exception:
+                frames_cache[k] = {}
+        return frames_cache[k]
 
     for logical, fname in files_map.items():
         fpath = resolve_data_file(data_dir, fname)
@@ -2514,18 +2611,37 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
 
                 try:
                     key = (int(cy), int(cq))
+                    per_share = CANONICAL[canonical]["per_share"]
                     series = get_series(src, comp, cid, canonical)
-                    api_local = series.get(key)
-                    if api_local is None and comp["market"] == "jp":
+                    primary = series.get(key)
+                    if primary is None and comp["market"] == "jp":
                         rec["note"] = sources["jp"].note
-                    if api_local is None:
+                    if primary is None:
                         rec["status"] = "MISSING_IN_API"
                         results.append(rec); continue
-                    status, api_m = compare(fv, api_local,
-                                            CANONICAL[canonical]["per_share"])
-                    rec["api_value_local"] = api_local
-                    rec["api_value_millions"] = "" if CANONICAL[canonical]["per_share"] else round(api_m, 3)
+                    # collect every distinct vintage this source reports for the
+                    # period (EDGAR as-filed vs restated) — primary/latest first —
+                    # and accept the file if it matches ANY of them.
+                    cand, seen = [primary], {round(primary, 2)}
+                    for v in get_frames(src, comp, cid, canonical).get(key, []):
+                        r = round(v, 2)
+                        if r not in seen:
+                            seen.add(r); cand.append(v)
+                    status, matched_local, api_m, matched = compare_multi(
+                        fv, cand, per_share)
+                    rec["api_value_local"] = matched_local
+                    rec["api_value_millions"] = "" if per_share else round(api_m, 3)
                     rec["status"] = status
+                    if len(cand) > 1:             # surface both vintages
+                        def _disp(x):
+                            return f"{x:.4f}" if per_share else f"{x / 1e6:.3f}"
+                        rec["note"] = (
+                            f"{len(cand)} EDGAR vintages for this period "
+                            f"(as-filed vs restated): "
+                            + " / ".join(_disp(c) for c in cand)
+                            + ("" if per_share else " (millions)")
+                            + (f"; file matches {_disp(matched_local)}" if matched
+                               else "; file matches none"))
                 except Exception as e:
                     rec["status"] = "ERROR"; rec["note"] = str(e)[:120]
                 results.append(rec)
