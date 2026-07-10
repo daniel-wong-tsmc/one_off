@@ -306,6 +306,35 @@ class EdgarSource(Source):
             f"https://data.sec.gov/api/xbrl/companyconcept/CIK{cik}/us-gaap/{tag}.json",
             headers={"User-Agent": SEC_UA}, cache_key=f"edgar_{cik}_{tag}")
 
+    @staticmethod
+    def _annual_by_end(d):
+        """{fiscal-year-end: value} for the ~365-day frames of a concept."""
+        out = {}
+        for x in (d or {}).get("units", {}).get("USD", []):
+            if x.get("start") and x.get("end"):
+                s = datetime.date.fromisoformat(x["start"])
+                e = datetime.date.fromisoformat(x["end"])
+                if 350 <= (e - s).days <= 380:
+                    out[x["end"]] = float(x["val"])
+        return out
+
+    def _revenue_tag_order(self, cik):
+        """Tag priority for REVENUE, with one correction: some filers (e.g. GM) tag
+        only part of revenue under RevenueFromContract...ExcludingAssessedTax and put
+        the true total under `Revenues` (GM Financial is excluded from the contracts
+        tag). If, at the SAME most-recent fiscal year-end, `Revenues` is materially
+        larger than the contracts tag, prefer `Revenues` so we pull total revenue.
+        Everyone whose tags agree (or who only files one) is unaffected."""
+        tags = list(self.metric_map["REVENUE"])
+        con = self._annual_by_end(
+            self._concept(cik, "RevenueFromContractWithCustomerExcludingAssessedTax"))
+        rev = self._annual_by_end(self._concept(cik, "Revenues"))
+        common = sorted(set(con) & set(rev))
+        if common and rev[common[-1]] > con[common[-1]] * 1.005:
+            tags.remove("Revenues")
+            tags.insert(0, "Revenues")
+        return tags
+
     def quarterly(self, api_id, metric, fye_month=12, years=None):
         cik = self._resolve_cik(api_id)
         if not cik:
@@ -315,8 +344,10 @@ class EdgarSource(Source):
         unit = "USD/shares" if per_share else "USD"
         # use the first fallback tag that actually has data (don't mix tags,
         # e.g. Excluding- vs Including-AssessedTax revenue)
+        tag_order = (self._revenue_tag_order(cik) if metric == "REVENUE"
+                     else self.metric_map[metric])
         facts = []
-        for tag in self.metric_map[metric]:
+        for tag in tag_order:
             d = self._concept(cik, tag)
             if d and d.get("units", {}).get(unit):
                 facts = d["units"][unit]
@@ -405,7 +436,9 @@ class EdgarSource(Source):
         kind = CANONICAL[metric]["kind"]
         unit = "USD/shares" if per_share else "USD"
         facts = []
-        for tag in self.metric_map[metric]:      # same tag quarterly() settled on
+        tag_order = (self._revenue_tag_order(cik) if metric == "REVENUE"
+                     else self.metric_map[metric])  # same tag quarterly() settled on
+        for tag in tag_order:
             d = self._concept(cik, tag)
             if d and d.get("units", {}).get(unit):
                 facts = d["units"][unit]
