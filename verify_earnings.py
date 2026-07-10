@@ -772,7 +772,16 @@ class OpenDartSource(Source):
         "PRE_TAX_INCOME": (["법인세비용차감전순이익", "법인세비용차감전계속사업이익",
                             "법인세차감전순이익", "법인세비용차감전순이익(손실)",
                             "법인세비용차감전계속영업이익"], ("IS", "CIS")),
-        "NET_INCOME": (["당기순이익", "당기순이익(손실)", "분기순이익", "반기순이익"], ("IS", "CIS")),
+        # net income ATTRIBUTABLE TO PARENT first (지배기업 소유주 귀속 당기순이익), then
+        # fall back to 당기순이익 (total) for a filer that reports no attribution
+        # split (no NCI, where the two are equal). _val honours this priority even
+        # though the total prints earlier in the statement. Total is NET_INCOME_INC_NCI.
+        "NET_INCOME": (["지배기업의소유주에게귀속되는당기순이익",
+                        "지배기업의소유주에게귀속되는당기순이익(손실)",
+                        "지배기업소유주지분순이익", "지배기업소유주지분",
+                        "당기순이익", "당기순이익(손실)", "연결당기순이익",
+                        "연결분기순이익", "연결반기순이익", "분기순이익", "반기순이익"],
+                       ("IS", "CIS")),
         "EPS_BASIC": (["기본주당이익", "기본주당이익(손실)", "기본주당순이익"], ("IS", "CIS")),
         "EPS_DILUTED": (["희석주당이익", "희석주당이익(손실)", "희석주당순이익"], ("IS", "CIS")),
         "ACCOUNTS_PAYABLE": (["매입채무", "매입채무및기타채무"], ("BS",)),
@@ -794,8 +803,10 @@ class OpenDartSource(Source):
         "SGA_EXPENSE": (["판매비와관리비", "판매비및관리비"], ("IS", "CIS")),
         "RD_EXPENSE": (["경상연구개발비", "연구개발비"], ("IS", "CIS")),
         "TAX_EXPENSE": (["법인세비용", "법인세비용(수익)"], ("IS", "CIS")),
-        # 당기순이익 in a consolidated statement is total profit incl. NCI.
+        # total profit incl. NCI. Filers label it 당기/분기/반기순이익, with or
+        # without the 연결 (consolidated) prefix — e.g. Hyundai uses 연결분기순이익.
         "NET_INCOME_INC_NCI": (["당기순이익", "당기순이익(손실)", "연결당기순이익",
+                                "연결분기순이익", "연결반기순이익",
                                 "분기순이익", "반기순이익"], ("IS", "CIS")),
         # cash-flow (sj_div 'CF'); YTD-cumulative like the income statement, so the
         # flow de-cumulation (_to_discrete) turns it into discrete quarters.
@@ -837,18 +848,24 @@ class OpenDartSource(Source):
     def _val(self, data, names, sj_divs):
         if not data or data.get("status") != "000":
             return None
-        # match on the account name with all internal whitespace removed: DART
-        # prints subtotals like '지배기업의 소유주에게 귀속되는 자본' with spaces that
-        # vary by filer, so a space-insensitive compare is far more robust.
-        wanted = {re.sub(r"\s", "", n) for n in names}
-        for row in data.get("list", []):
-            nm = re.sub(r"\s", "", row.get("account_nm") or "")
-            if nm in wanted and row.get("sj_div") in sj_divs:
-                raw = (row.get("thstrm_amount") or "").replace(",", "").strip()
-                try:
-                    return float(raw)
-                except ValueError:
-                    return None
+        # match account names in CANDIDATE-PRIORITY order (not statement order) and
+        # with all internal whitespace removed. Priority matters for net income: a
+        # consolidated statement lists BOTH 당기순이익 (total) and the
+        # 지배기업 소유주 귀속 당기순이익 (parent) line, with the total appearing first —
+        # so we must prefer the earlier-listed candidate (parent) rather than
+        # whichever row comes first. Whitespace stripping handles filer-specific
+        # spacing like '지배기업의 소유주에게 귀속되는 자본'.
+        rows = data.get("list", [])
+        for name in names:
+            want = re.sub(r"\s", "", name)
+            for row in rows:
+                nm = re.sub(r"\s", "", row.get("account_nm") or "")
+                if nm == want and row.get("sj_div") in sj_divs:
+                    raw = (row.get("thstrm_amount") or "").replace(",", "").strip()
+                    try:
+                        return float(raw)
+                    except ValueError:
+                        return None
         return None
 
     def quarterly(self, api_id, metric, fye_month=12, years=None):
@@ -1221,7 +1238,12 @@ class FinMindSource(Source):
         "GROSS_PROFIT": (IS, "GrossProfit"),
         "OPERATING_INCOME": (IS, "OperatingIncome"),
         "PRE_TAX_INCOME": (IS, "PreTaxIncome"),
-        "NET_INCOME": (IS, "IncomeAfterTaxes"),
+        # net income ATTRIBUTABLE TO PARENT (母公司業主淨利), matching how "net
+        # income" is universally reported. Falls back to IncomeAfterTaxes (本期淨利,
+        # total) only for a filer that reports no attributable split (no NCI).
+        # The total-incl-NCI figure is NET_INCOME_INC_NCI. This matters a lot for
+        # high-NCI filers (Pegatron, Hon Hai): the two differ by 10%+.
+        "NET_INCOME": (IS, ["EquityAttributableToOwnersOfParent", "IncomeAfterTaxes"]),
         "EPS_BASIC": (IS, "EPS"),
         "ACCOUNTS_PAYABLE": (BS, "AccountsPayable"),
         "CURRENT_ASSETS": (BS, "CurrentAssets"),
@@ -1259,14 +1281,17 @@ class FinMindSource(Source):
 
     def quarterly(self, api_id, metric, fye_month=12, years=None):
         dataset, typ = self.metric_map[metric]
+        types = typ if isinstance(typ, (list, tuple)) else [typ]
         d = self._data(dataset, api_id.strip())
         if not d or d.get("status") != 200:
             return {}
-        out = {}
-        for row in d.get("data", []):
-            if row.get("type") == typ:
-                out[cal_key_from_date(row["date"])] = float(row["value"])
-        return out
+        # try the types in priority order, first one with any data wins (don't mix)
+        for t in types:
+            out = {cal_key_from_date(r["date"]): float(r["value"])
+                   for r in d.get("data", []) if r.get("type") == t}
+            if out:
+                return out
+        return {}
 
 
 # ---- China A-shares: Eastmoney F10 (the data AKShare wraps) ---------------- #

@@ -108,6 +108,13 @@ Outputs:
    local reporting currency** (TSMC accounts payable `27661.85` ⇒ NT$27.66 bn).
    Every source returns full local currency, which the script divides by 1e6
    before comparing. Per-share metrics (EPS) are compared directly.
+2b. **`NET_INCOME` = attributable to the parent's owners** (母公司業主 / 지배기업
+   소유주 / owners-of-parent) in every market — the figure universally reported as
+   "net income" and quoted by data providers. The **total including
+   non-controlling interest** is a separate code, `NET_INCOME_INC_NCI`. For
+   high-NCI groups the two differ a lot (e.g. Pegatron, Hon Hai ~10%+), so a file
+   holding the standard parent figure reconciles against `NET_INCOME`, not the
+   consolidated total.
 3. **Quarters.** Compared as **discrete (3-month) quarters**, matched to the
    calendar quarter the fiscal period falls in. The period-end date is snapped to
    the **nearest calendar quarter-end** first, so 52/53-week filers whose quarters
