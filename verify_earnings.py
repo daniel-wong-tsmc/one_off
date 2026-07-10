@@ -1109,13 +1109,15 @@ class AKShareSource(Source):
     def _mainop(self, secucode):
         return self._fetch(self.MAINOP, secucode)
 
-    def segment_quarterly(self, api_id, fye_month, years, label, want, is_geo):
+    def semiannual_composition(self, api_id, fye_month, years, label, want, is_geo):
         """{(cal_y, cal_q): value_RMB} for a Chinese GEOGRAPHIC region (分地区) or
-        business SEGMENT (分产品/分行业) main-business revenue. Revenue only.
-        Half-year figure -> Q2, full-year -> Q4, both CUMULATIVE (Q1/Q3 not
-        disclosed by Chinese issuers). Geographic labels auto-match (境内/境外 and
-        named regions); segment labels match the 产品/行业 item name (substring),
-        mappable via segment_members.csv."""
+        business SEGMENT (分产品/分行业) main-business revenue, keyed H1->Q2 and
+        FY->Q4, both CUMULATIVE. This is the *only* granularity Chinese issuers
+        disclose. NOT used by the discrete-quarter reconciliation (see
+        segment_quarterly) — exposed for manual/aggregate spot-checks (e.g. confirm
+        the user's Q1+Q2 sums to the disclosed H1, or Q1..Q4 to the full year).
+        Geographic labels auto-match (境内/境外 and named regions); segment labels
+        match the 产品/行业 item name (substring)."""
         if want == "opincome":
             return {}
         rows = self._mainop(self._secucode(api_id))
@@ -1153,6 +1155,15 @@ class AKShareSource(Source):
             got = collect(t)
             if got:
                 return got
+        return {}
+
+    def segment_quarterly(self, api_id, fye_month, years, label, want, is_geo):
+        """China discloses segment/geographic revenue ONLY in the half-year and
+        annual reports (cumulative) — never for discrete quarters. This tool
+        reconciles DISCRETE quarters, so there is no comparable figure: return
+        empty so the row is reported MISSING (never a false discrete match against
+        a cumulative H1/FY value). The semi-annual figures remain available via
+        semiannual_composition() for aggregate spot-checks."""
         return {}
 
 
@@ -2073,8 +2084,12 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
                         api_local = ser.get((int(cy), int(cq)))
                         if api_local is None:
                             rec["status"] = "MISSING_IN_API"
-                            rec["note"] = ("no discrete-quarter dimensional fact "
-                                           "(annual-only disclosure or period absent)")
+                            rec["note"] = (
+                                "China discloses segment/geo only semi-annually "
+                                "(cumulative H1 + full-year); no discrete-quarter figure"
+                                if market == "cn" else
+                                "no discrete-quarter dimensional fact "
+                                "(annual-only disclosure or period absent)")
                             results.append(rec); continue
                         status, api_m = compare(fv, api_local, False)
                         rec["api_value_local"] = api_local

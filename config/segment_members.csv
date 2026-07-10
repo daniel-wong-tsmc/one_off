@@ -35,9 +35,9 @@ company_id,label,member
 # 158,Other,其他事業群
 # (TSMC 2330 is single-segment — foundry only — so it has no business-segment split.)
 #
-# China (Eastmoney 主营构成): geographic (分地区) auto-matches — 境内/Domestic and
-# 境外/Overseas (plus named regions where disclosed) — no mapping needed. BUSINESS
-# segments (分产品/分行业): `member` is the Chinese 产品/行业 item name, matched as a
-# substring, e.g. TongFu (143): 143,IC,集成电路封装测试
-# NOTE: China discloses the breakdown only half-yearly, so segment/geo values are
-# CUMULATIVE H1 (mapped to Q2) and full-year (mapped to Q4); Q1/Q3 -> MISSING.
+# China (Eastmoney 主营构成): NOT reconcilable against discrete-quarter files.
+# Chinese issuers disclose segment/geo revenue only semi-annually (cumulative H1 +
+# full-year, report dates 06-30 / 12-31), never per quarter — so China segment/geo
+# rows are reported MISSING (no mapping helps). The semi-annual figures are still
+# extractable in code via AKShareSource.semiannual_composition() for aggregate
+# spot-checks (e.g. confirm your Q1+Q2 sums to the disclosed H1).
