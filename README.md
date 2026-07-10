@@ -11,7 +11,7 @@ does not match**.
 | 🇰🇷 Korea | OpenDART | `DART_KEY` (free) | quarterly, full history | 🟡 geographic **and** business-segment revenue (all 4 quarters) from the DART note tables |
 | 🇹🇼 Taiwan | FinMind (statements) + MOPS PDF book (segment/geo) | `FINMIND_TOKEN` optional; MOPS needs none | quarterly, full history | 🟡 geographic **and** business-segment revenue, parsed from the MOPS financial-report-book PDF |
 | 🇯🇵 Japan | J-Quants V2 + EDINET | `JQUANTS_KEY`, `EDINET_KEY` (free) | quarterly recent ~2yr (J-Quants) + pre-2024 quarterly & annual (EDINET 四半期/有価証券報告書) | ✅ EDINET dimensional XBRL |
-| 🇨🇳 China A-shares | Eastmoney F10 (AKShare data) | none | quarterly statements (YTD-cumulative → de-cumulated) | ⛔ not yet (segment/geo in cninfo notes) |
+| 🇨🇳 China A-shares | Eastmoney F10 (AKShare data) | none | quarterly statements (YTD-cumulative → de-cumulated) | 🟡 geo (境内/境外) + segment revenue — **H1 & full-year only** (主营构成) |
 
 ## Setup
 

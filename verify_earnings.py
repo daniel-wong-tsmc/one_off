@@ -502,6 +502,11 @@ _REGION_CANON = {
     "美國": "US", "北美": "US", "北美洲": "US", "美洲": "US", "NORTHAMERICA": "US",
     "AMERICA": "US", "AMERICAS": "US",
     "中國": "CN", "中國大陸": "CN", "大陸": "CN",
+    # China A-share 主营构成 geographic labels (domestic / overseas split)
+    "境內": "DOMESTIC", "境内": "DOMESTIC", "國內": "DOMESTIC", "国内": "DOMESTIC",
+    "中國境內": "DOMESTIC", "中国境内": "DOMESTIC", "大陸地區": "DOMESTIC",
+    "DOMESTIC": "DOMESTIC", "境外": "OVERSEAS", "國外": "OVERSEAS", "国外": "OVERSEAS",
+    "海外": "OVERSEAS", "中國境外": "OVERSEAS", "中国境外": "OVERSEAS", "OVERSEAS": "OVERSEAS",
     "日本": "JP",
     "歐洲、中東及非洲": "EMEA", "歐洲中東及非洲": "EMEA", "歐非中東": "EMEA",
     "歐中非": "EMEA", "EMEA": "EMEA",
@@ -1092,6 +1097,63 @@ class AKShareSource(Source):
                     out[cal_key_from_date(d)] = cum - qm[q - 1][1]
                 # else: prior quarter missing -> can't de-cumulate, skip
         return out
+
+    # ---- segment / geographic revenue (主营构成, 主营业务分地区/分产品/分行业) ---- #
+    # Chinese issuers disclose the main-business breakdown only in the ANNUAL and
+    # HALF-YEAR reports (report dates 12-31 and 06-30) — never in the Q1/Q3 reports.
+    # So this returns CUMULATIVE half-year (mapped to Q2) and full-year (mapped to
+    # Q4) revenue, NOT discrete quarters. Geography is usually a 境内/境外
+    # (domestic/overseas) split; segments are 产品 (product) / 行业 (industry).
+    MAINOP = "RPT_F10_FN_MAINOP"
+
+    def _mainop(self, secucode):
+        return self._fetch(self.MAINOP, secucode)
+
+    def segment_quarterly(self, api_id, fye_month, years, label, want, is_geo):
+        """{(cal_y, cal_q): value_RMB} for a Chinese GEOGRAPHIC region (分地区) or
+        business SEGMENT (分产品/分行业) main-business revenue. Revenue only.
+        Half-year figure -> Q2, full-year -> Q4, both CUMULATIVE (Q1/Q3 not
+        disclosed by Chinese issuers). Geographic labels auto-match (境内/境外 and
+        named regions); segment labels match the 产品/行业 item name (substring),
+        mappable via segment_members.csv."""
+        if want == "opincome":
+            return {}
+        rows = self._mainop(self._secucode(api_id))
+        seg_target = None if is_geo else _seg_norm(label)
+        region = _canon_region(label) if is_geo else None
+        types = ("3",) if is_geo else ("2", "1")   # 3=地区; 2=产品 then 1=行业
+
+        def collect(mainop_type):
+            out = {}
+            for r in rows:
+                if r.get("MAINOP_TYPE") != mainop_type:
+                    continue
+                item = r.get("ITEM_NAME") or ""
+                v = r.get("MAIN_BUSINESS_INCOME")
+                rd = r.get("REPORT_DATE")
+                if v is None or not rd:
+                    continue
+                if is_geo:
+                    if _canon_region(item) != region:
+                        continue
+                else:
+                    if not seg_target or seg_target not in _seg_norm(item):
+                        continue
+                mo = int(rd[5:7])
+                q = {6: 2, 12: 4}.get(mo)          # H1 -> Q2, FY -> Q4
+                if q is None:
+                    continue
+                try:
+                    out[(int(rd[:4]), q)] = float(v)
+                except (TypeError, ValueError):
+                    pass
+            return out
+
+        for t in types:                            # product preferred over industry
+            got = collect(t)
+            if got:
+                return got
+        return {}
 
 
 # ---- Taiwan segment/geo: MOPS financial-report book (PDF notes) ------------ #
@@ -1964,6 +2026,14 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
                                        "(TW: the 部門 name in the 部門資訊 note, "
                                        "e.g. '資通訊產品事業群')")
                         results.append(rec); continue
+                    elif market == "cn" and not is_geo and not member:
+                        # CN business segments need the 产品/行业 item name (geographic
+                        # 境内/境外 auto-matches).
+                        rec["status"] = "NO_SEGMENT_MAPPING"
+                        rec["note"] = (f"map '{label}' in config/segment_members.csv "
+                                       "(CN: the 产品/行业 name in 主营构成, e.g. "
+                                       "'集成电路封装测试')")
+                        results.append(rec); continue
 
                     try:
                         if market == "us":
@@ -1987,6 +2057,13 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
                             # TW geographic revenue: matched by region name; business
                             # segment: mapped 部門 name. Parsed from the MOPS PDF book.
                             ser = mops_tw.segment_quarterly(
+                                comp["api_id"], comp["fye_month"],
+                                years_by_company.get(cid), member or label, want, is_geo)
+                        elif market == "cn":
+                            # CN main-business composition (主营构成): geographic 境内/境外
+                            # auto-matches; segment = mapped 产品/行业 name. Half-year and
+                            # full-year cumulative only (Q2/Q4), never discrete quarters.
+                            ser = sources["cn"].segment_quarterly(
                                 comp["api_id"], comp["fye_month"],
                                 years_by_company.get(cid), member or label, want, is_geo)
                         else:
