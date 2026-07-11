@@ -129,20 +129,25 @@ core assumptions checked out:
   in EDGAR companyconcept (no quarterly/YTD facts), so e.g. 2023Q1 legitimately
   returns `MISSING_IN_API` — a data-availability gap, not a tool bug.
 
-### Finance-arm ACCOUNTS_RECEIVABLE (GM / Ford) — the user's convention
-For captive-finance filers, the user's `ACCOUNTS_RECEIVABLE` = automotive **trade**
-receivables (current) **+ the finance subsidiary's receivables (current portion)**.
+### Finance-arm ACCOUNTS_RECEIVABLE — the user's convention
+For captive-finance filers, the user's `ACCOUNTS_RECEIVABLE` = **trade** receivables
+(current) **+ the finance subsidiary's receivables (current portion)**.
 `us-gaap:AccountsReceivableNetCurrent` (companyconcept) is trade-only, so the finance
-line is read straight from the filing's **XBRL instance** (companyconcept never
-carries it): `EdgarDimensional.instant_series()` parses all point-in-time facts in
-`<doc>_htm.xml` and, per element per instant, takes the fact with the **fewest
-dimensions** (the aggregate, not a portfolio/segment sub-breakdown), then sums.
-Config: `US_FINANCE_RECEIVABLE` (CIK → extra current finance-receivable element
-local-names). Both use `NotesAndLoansReceivableNetCurrent` — GM's is dimensioned on
-`BusinessGroupAxis=GmFinancialMember`, Ford's is an undimensioned face line; the
-fewest-dimensions rule handles both. **Non-current** finance receivables are
-excluded. Every other US filer is untouched (trade only). **Verified:** GM 2026Q1 =
-16,381 + 43,751 = **60,132**; Ford 2026Q1 = 17,227 + 46,185 = **63,412** (US$M).
+line is read from the filing's **XBRL instance**: `EdgarDimensional.instant_series()`
+parses all point-in-time facts in `<doc>_htm.xml` and, per element per instant, takes
+the fact with the **fewest dimensions** (the aggregate, not a portfolio/segment
+sub-breakdown), then sums. Config: `US_FINANCE_RECEIVABLE` (CIK → extra current
+finance-receivable element local-names). All entries use
+`NotesAndLoansReceivableNetCurrent` — GM's is dimensioned on
+`BusinessGroupAxis=GmFinancialMember`, the rest are undimensioned face lines; the
+fewest-dimensions rule handles both. **Non-current** finance receivables are excluded.
+The affected filers were found by scanning every US filer's companyconcept for a
+current finance-receivable tag (only captive-finance arms have one): **GM, Ford, Dell
+(Dell Financial Services), Cisco (Cisco Systems Capital), HPE (HPE Financial
+Services)**. Every other US filer is untouched (trade only). **Verified:** GM 2026Q1 =
+16,381 + 43,751 = **60,132**; Ford = 17,227 + 46,185 = **63,412**; Dell cal-2025Q3 =
+11,721 + 6,427 = **18,148**; Cisco = 4,827 + 3,085 = **7,912**; HPE latest = 6,286 +
+3,694 = **9,980** (US$M) — all matching the as-filed balance sheets.
 
 ### SG&A excluding R&D — the user's convention (KR done, JP no-value)
 The user's SG&A **excludes** R&D (US ON Semi SGA = S&M + G&A, no R&D). KR 판매비와관리비

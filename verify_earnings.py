@@ -260,6 +260,9 @@ _US_SGA_SPEC = {
 US_FINANCE_RECEIVABLE = {
     "0001467858": ["NotesAndLoansReceivableNetCurrent"],   # GM   -> GM Financial receivables, net (current)
     "0000037996": ["NotesAndLoansReceivableNetCurrent"],   # Ford -> Ford Credit finance receivables, net (current)
+    "0000858877": ["NotesAndLoansReceivableNetCurrent"],   # Cisco -> Cisco Systems Capital financing receivables, net (current)
+    "0001571996": ["NotesAndLoansReceivableNetCurrent"],   # Dell  -> Dell Financial Services short-term financing receivables, net (current; long-term portion excluded)
+    "0001645590": ["NotesAndLoansReceivableNetCurrent"],   # HPE   -> HPE Financial Services financing receivables, net (current; long-term portion excluded)
 }
 
 
