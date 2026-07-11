@@ -228,6 +228,13 @@ class Source:
     market = "?"
     available = True
     note = ""
+    # Whether quarterly()'s value is the MOST-RECENTLY-FILED vintage of a period.
+    # EDGAR companyconcept yields the latest fact, so its primary IS the latest and
+    # frames() supplies older as-originally-filed values (True). DART/EDINET instead
+    # read a period from its OWN report (the as-originally-filed figure) and frames()
+    # recovers the NEWER restatement from the following year's comparative, so their
+    # primary is the OLDEST (False). This drives the latest-vs-superseded labelling.
+    primary_is_latest = True
 
     def supports(self, metric: str) -> bool:
         return metric in self.metric_map
@@ -1142,6 +1149,7 @@ def _canon_region(s: str) -> str:
 # ---- Korea: OpenDART ------------------------------------------------------ #
 class OpenDartSource(Source):
     market = "kr"
+    primary_is_latest = False   # primary = as-originally-filed; frames() = newer restatement
     metric_map = {
         "REVENUE": (["매출액", "수익(매출액)", "영업수익", "매출"], ("IS", "CIS")),
         "COGS": (["매출원가"], ("IS", "CIS")),
@@ -2423,6 +2431,7 @@ def _month_last_day(y, m):
 
 class EdinetSource(Source):
     market = "jp"
+    primary_is_latest = False   # primary = as-originally-filed; frames() = newer restatement
     # canonical -> XBRL element id(s), tried in order. Read at CurrentYTDDuration
     # (quarterly report) or CurrentYearDuration (annual securities report); YTD
     # values de-cumulated. Each metric lists the Japanese-GAAP element (jppfs_cor)
@@ -2959,6 +2968,7 @@ class JQuantsSource(Source):
 # ---- Japan composite: J-Quants (recent) + EDINET (annual / future quarterly) #
 class JapanSource(Source):
     market = "jp"
+    primary_is_latest = False   # primary = as-originally-filed; frames() = newer restatement
 
     def __init__(self):
         self.jq = JQuantsSource()
@@ -2986,6 +2996,19 @@ class JapanSource(Source):
                 except Exception:
                     pass
         return out
+
+    def frames(self, api_id, metric, fye_month=12, years=None):
+        """Prior-year-comparative restatement vintages come from EDINET only —
+        J-Quants /fins/summary exposes a single (as-released) figure, not the
+        following year's restated comparative. Delegate to the EDINET source so JP
+        vintages actually reach run() (this composite, not EdinetSource, is the
+        registered 'jp' source)."""
+        if self.ed.available:
+            try:
+                return self.ed.frames(api_id, metric, fye_month, years)
+            except Exception:
+                return {}
+        return {}
 
 
 # --------------------------------------------------------------------------- #
@@ -3115,17 +3138,28 @@ def _vfmt(x, per_share):
     return f"{x:.4f}" if per_share else f"{x / 1e6:.3f}"
 
 
-def vintage_columns(cand, primary, matched_local, matched, per_share):
+def latest_vintage(cand, primary, primary_is_latest):
+    """The most-recently-filed value among the candidates. For EDGAR the primary IS
+    the latest; for DART/EDINET the primary is the as-originally-filed figure and the
+    newer restatement is the non-primary frames() vintage, so the latest is the
+    candidate that differs from the primary (there is at most one such restatement)."""
+    if primary_is_latest:
+        return primary
+    return next((c for c in cand if round(c, 2) != round(primary, 2)), primary)
+
+
+def vintage_columns(cand, primary, matched_local, matched, per_share,
+                    primary_is_latest=True):
     """Transparency columns for one statement row. Returns
     (api_vintages, vintage_match):
       api_vintages  — every distinct candidate vintage, formatted like the note
                       ("1445.000 / 1392.000"); a lone value is just that value.
-      vintage_match — "latest" if the file matched the primary/latest value,
+      vintage_match — "latest" if the file matched the most-recently-filed value,
                       "superseded" if it matched an older value the company has
                       since restated, "none" on MISMATCH, "" when not applicable
                       (per-share, or a single vintage with nothing to supersede).
-    Superseded == matched a non-latest: matched and round(matched_local,2) !=
-    round(primary,2)."""
+    Which candidate is "latest" is source-dependent (see latest_vintage): EDGAR's
+    primary is the latest, DART/EDINET's primary is the as-originally-filed value."""
     api_vintages = " / ".join(_vfmt(c, per_share) for c in cand)
     if per_share:
         return api_vintages, ""
@@ -3133,9 +3167,10 @@ def vintage_columns(cand, primary, matched_local, matched, per_share):
         return api_vintages, "none"
     if len(cand) <= 1:
         return api_vintages, ""
-    return api_vintages, ("superseded"
-                          if round(matched_local, 2) != round(primary, 2)
-                          else "latest")
+    latest = latest_vintage(cand, primary, primary_is_latest)
+    return api_vintages, ("latest"
+                          if round(matched_local, 2) == round(latest, 2)
+                          else "superseded")
 
 
 def export_files(export_dir: Path, results: list, files_map: dict):
@@ -3630,24 +3665,27 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
                     rec["api_value_local"] = matched_local
                     rec["api_value_millions"] = "" if per_share else round(api_m, 3)
                     rec["status"] = status
+                    pil = getattr(src, "primary_is_latest", True)
                     rec["api_vintages"], rec["vintage_match"] = vintage_columns(
-                        cand, primary, matched_local, matched, per_share)
+                        cand, primary, matched_local, matched, per_share, pil)
                     if len(cand) > 1:             # surface both vintages
-                        if (matched and not per_share
-                                and round(matched_local, 2) != round(primary, 2)):
+                        latest = latest_vintage(cand, primary, pil)
+                        unit = "" if per_share else " (millions)"
+                        vlist = " / ".join(_vfmt(c, per_share) for c in cand)
+                        if (matched and round(matched_local, 2) != round(latest, 2)):
                             # MATCH against a superseded vintage: the file is an
-                            # as-filed value the company has since restated.
+                            # older value the company has since restated.
                             rec["note"] = (
-                                f"matches as-filed {_vfmt(matched_local, per_share)}; "
-                                f"restated since to {_vfmt(primary, per_share)}"
-                                + ("" if per_share else " (millions)"))
+                                f"matches a superseded filing vintage "
+                                f"{_vfmt(matched_local, per_share)}; latest filed value "
+                                f"is {_vfmt(latest, per_share)}{unit} "
+                                f"(all vintages: {vlist})")
                         else:
                             rec["note"] = (
                                 f"{len(cand)} filed vintages for this period "
-                                f"(as-filed vs restated): "
-                                + " / ".join(_vfmt(c, per_share) for c in cand)
-                                + ("" if per_share else " (millions)")
-                                + (f"; file matches {_vfmt(matched_local, per_share)}"
+                                f"(as-filed vs restated): {vlist}{unit}"
+                                + (f"; file matches the latest "
+                                   f"{_vfmt(matched_local, per_share)}"
                                    if matched else "; file matches none"))
                 except Exception as e:
                     rec["status"] = "ERROR"; rec["note"] = str(e)[:120]
