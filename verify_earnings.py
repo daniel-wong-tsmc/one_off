@@ -1245,7 +1245,11 @@ class FinMindSource(Source):
         # high-NCI filers (Pegatron, Hon Hai): the two differ by 10%+.
         "NET_INCOME": (IS, ["EquityAttributableToOwnersOfParent", "IncomeAfterTaxes"]),
         "EPS_BASIC": (IS, "EPS"),
-        "ACCOUNTS_PAYABLE": (BS, "AccountsPayable"),
+        # trade payables (應付帳款) + payables to related parties (應付帳款-關係人):
+        # Taiwan files these as two lines; data providers report the sum as
+        # "accounts payable", so sum them to match.
+        "ACCOUNTS_PAYABLE": (BS, {"sum": ["AccountsPayable",
+                                          "AccountsPayableToRelatedParties"]}),
         "CURRENT_ASSETS": (BS, "CurrentAssets"),
         "TOTAL_ASSETS": (BS, "TotalAssets"),
         "CURRENT_LIABILITIES": (BS, "CurrentLiabilities"),
@@ -1281,14 +1285,28 @@ class FinMindSource(Source):
 
     def quarterly(self, api_id, metric, fye_month=12, years=None):
         dataset, typ = self.metric_map[metric]
-        types = typ if isinstance(typ, (list, tuple)) else [typ]
         d = self._data(dataset, api_id.strip())
         if not d or d.get("status") != 200:
             return {}
-        # try the types in priority order, first one with any data wins (don't mix)
+        rows = d.get("data", [])
+        # {"sum": [...]} -> ADD the sub-lines per period (e.g. trade accounts
+        # payable + accounts payable to related parties). A period keeps whatever
+        # sub-lines it reports (a missing one just contributes nothing).
+        if isinstance(typ, dict) and "sum" in typ:
+            out = {}
+            for r in rows:
+                if r.get("type") in typ["sum"]:
+                    try:
+                        k = cal_key_from_date(r["date"])
+                        out[k] = out.get(k, 0.0) + float(r["value"])
+                    except (TypeError, ValueError):
+                        pass
+            return out
+        # list -> try the types in priority order, first with any data wins
+        types = typ if isinstance(typ, (list, tuple)) else [typ]
         for t in types:
             out = {cal_key_from_date(r["date"]): float(r["value"])
-                   for r in d.get("data", []) if r.get("type") == t}
+                   for r in rows if r.get("type") == t}
             if out:
                 return out
         return {}
