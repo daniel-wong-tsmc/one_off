@@ -237,6 +237,17 @@ class Source:
         return {}
 
 
+# US SG&A = the combined SG&A tag when a filer reports one, else Selling &
+# Marketing + G&A summed (filers like ON Semi split them into two lines, so the
+# single G&A tag alone understates SG&A). Shared by SGA_EXPENSE and the
+# OPERATING_EXPENSE fallback.
+_US_SGA_SPEC = {
+    "prefer": ["SellingGeneralAndAdministrativeExpense"],
+    "else": {"sum": [["SellingAndMarketingExpense", "SellingExpense"],
+                     ["GeneralAndAdministrativeExpense"]]},
+}
+
+
 # ---- US: SEC EDGAR -------------------------------------------------------- #
 class EdgarSource(Source):
     market = "us"
@@ -283,12 +294,19 @@ class EdgarSource(Source):
         "NON_CONTROL_INTEREST": ["MinorityInterest"],
         "CONTRACT_LIABILITIES": ["ContractWithCustomerLiabilityCurrent",
                                  "ContractWithCustomerLiability"],
-        "OPERATING_EXPENSE": ["OperatingExpenses", "OperatingCostsAndExpenses",
-                              "CostsAndExpenses"],
+        # operating expenses EXCLUDING COGS: the reported OperatingExpenses line
+        # when a filer has one (ON Semi: 354), else SG&A + R&D (Ford has no
+        # OperatingExpenses tag and no separate R&D, so this = SG&A = 2,807).
+        # Deliberately NOT CostsAndExpenses — that is TOTAL costs incl. COGS, a
+        # different metric (Ford 40,924, HPE's total) that this used to return.
+        "OPERATING_EXPENSE": {
+            "prefer": ["OperatingExpenses", "OperatingCostsAndExpenses"],
+            "else": {"sum": [_US_SGA_SPEC,
+                             ["ResearchAndDevelopmentExpense",
+                              "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost"]]}},
         "RD_EXPENSE": ["ResearchAndDevelopmentExpense",
                        "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost"],
-        "SGA_EXPENSE": ["SellingGeneralAndAdministrativeExpense",
-                        "GeneralAndAdministrativeExpense"],
+        "SGA_EXPENSE": _US_SGA_SPEC,
         "TAX_EXPENSE": ["IncomeTaxExpenseBenefit"],
         "NET_INCOME_INC_NCI": ["ProfitLoss"],
         "DEPRECIATION_AND_AMORTIZATION": ["DepreciationDepletionAndAmortization",
@@ -349,25 +367,20 @@ class EdgarSource(Source):
             tags.insert(0, "Revenues")
         return tags
 
-    def quarterly(self, api_id, metric, fye_month=12, years=None):
-        cik = self._resolve_cik(api_id)
-        if not cik:
-            return {}
-        per_share = CANONICAL[metric]["per_share"]
-        kind = CANONICAL[metric]["kind"]
-        unit = "USD/shares" if per_share else "USD"
-        # use the first fallback tag that actually has data (don't mix tags,
-        # e.g. Excluding- vs Including-AssessedTax revenue)
-        tag_order = (self._revenue_tag_order(cik) if metric == "REVENUE"
-                     else self.metric_map[metric])
-        facts = []
-        for tag in tag_order:
+    def _facts_for(self, cik, tags, unit):
+        """Facts of the first tag (priority order) that actually has data in `unit`
+        (don't mix tags, e.g. Excluding- vs Including-AssessedTax revenue)."""
+        for tag in tags:
             d = self._concept(cik, tag)
             if d and d.get("units", {}).get(unit):
-                facts = d["units"][unit]
-                break
-        if not facts:
-            return {}
+                return d["units"][unit]
+        return []
+
+    @staticmethod
+    def _series_from_facts(facts, kind):
+        """{(cal_y, cal_q): value} from a concept's raw facts — point-in-time for
+        stock, discrete quarters for flow (Q4 preferred-as-filed then derived, plus
+        a YTD-ladder fallback)."""
         if kind == "stock":
             out = {}
             for x in facts:
@@ -444,6 +457,40 @@ class EdgarSource(Source):
                 prev_v, prev_q = v, qi
         return out
 
+    def _resolve(self, cik, spec, kind, unit):
+        """Resolve a metric spec to a discrete series. `spec` is one of:
+          - list of tags        -> first tag with data (priority order)
+          - {"sum":[spec, ...]} -> add the sub-series per period (each de-cumulated
+                                   first, so summing discrete quarters is correct;
+                                   e.g. SG&A = Selling&Marketing + G&A)
+          - {"prefer":spec, "else":spec} -> prefer if it yields data, else the
+                                   fallback (e.g. the OperatingExpenses line, else
+                                   SG&A + R&D)"""
+        if isinstance(spec, dict) and "sum" in spec:
+            total, got = {}, False
+            for sub in spec["sum"]:
+                s = self._resolve(cik, sub, kind, unit)
+                if s:
+                    got = True
+                for k, v in s.items():
+                    total[k] = total.get(k, 0.0) + v
+            return total if got else {}
+        if isinstance(spec, dict) and "prefer" in spec:
+            s = self._resolve(cik, spec["prefer"], kind, unit)
+            return s if s else self._resolve(cik, spec["else"], kind, unit)
+        tags = spec if isinstance(spec, list) else [spec]
+        return self._series_from_facts(self._facts_for(cik, tags, unit), kind)
+
+    def quarterly(self, api_id, metric, fye_month=12, years=None):
+        cik = self._resolve_cik(api_id)
+        if not cik:
+            return {}
+        kind = CANONICAL[metric]["kind"]
+        unit = "USD/shares" if CANONICAL[metric]["per_share"] else "USD"
+        spec = (self._revenue_tag_order(cik) if metric == "REVENUE"
+                else self.metric_map[metric])
+        return self._resolve(cik, spec, kind, unit)
+
     def frames(self, api_id, metric, fye_month=12, years=None):
         """All distinct as-reported vintages of each directly-filed period, so a
         restated quarter surfaces alongside the as-originally-filed one instead of
@@ -456,12 +503,17 @@ class EdgarSource(Source):
         cik = self._resolve_cik(api_id)
         if not cik:
             return {}
+        spec = self.metric_map[metric]
+        # vintages only apply to a single reported line; computed sums/prefer specs
+        # (SG&A, OPERATING_EXPENSE) have no as-filed-vs-restated ambiguity.
+        if isinstance(spec, dict):
+            return {}
         per_share = CANONICAL[metric]["per_share"]
         kind = CANONICAL[metric]["kind"]
         unit = "USD/shares" if per_share else "USD"
         facts = []
         tag_order = (self._revenue_tag_order(cik) if metric == "REVENUE"
-                     else self.metric_map[metric])  # same tag quarterly() settled on
+                     else spec)  # same tag quarterly() settled on
         for tag in tag_order:
             d = self._concept(cik, tag)
             if d and d.get("units", {}).get(unit):
