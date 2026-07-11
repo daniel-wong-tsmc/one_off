@@ -129,6 +129,52 @@ core assumptions checked out:
   in EDGAR companyconcept (no quarterly/YTD facts), so e.g. 2023Q1 legitimately
   returns `MISSING_IN_API` — a data-availability gap, not a tool bug.
 
+### Finance-arm ACCOUNTS_RECEIVABLE (GM / Ford) — the user's convention
+For captive-finance filers, the user's `ACCOUNTS_RECEIVABLE` = automotive **trade**
+receivables (current) **+ the finance subsidiary's receivables (current portion)**.
+`us-gaap:AccountsReceivableNetCurrent` (companyconcept) is trade-only, so the finance
+line is read straight from the filing's **XBRL instance** (companyconcept never
+carries it): `EdgarDimensional.instant_series()` parses all point-in-time facts in
+`<doc>_htm.xml` and, per element per instant, takes the fact with the **fewest
+dimensions** (the aggregate, not a portfolio/segment sub-breakdown), then sums.
+Config: `US_FINANCE_RECEIVABLE` (CIK → extra current finance-receivable element
+local-names). Both use `NotesAndLoansReceivableNetCurrent` — GM's is dimensioned on
+`BusinessGroupAxis=GmFinancialMember`, Ford's is an undimensioned face line; the
+fewest-dimensions rule handles both. **Non-current** finance receivables are
+excluded. Every other US filer is untouched (trade only). **Verified:** GM 2026Q1 =
+16,381 + 43,751 = **60,132**; Ford 2026Q1 = 17,227 + 46,185 = **63,412** (US$M).
+
+### SG&A excluding R&D — the user's convention (KR done, JP no-value)
+The user's SG&A **excludes** R&D (US ON Semi SGA = S&M + G&A, no R&D). KR 판매비와관리비
+and JP 販管費 both **include** R&D, so it must be subtracted.
+- **Korea (done).** `OpenDartSource._sga_note_rd()` reads the R&D line
+  (경상연구개발비 / 경상개발비 / 연구비, …) from the **판매비와관리비 functional-breakdown
+  note** in `document.xml` (validated: the table carries the 판매비와관리비 total row and
+  a 급여 row; first qualifying table in doc order = the 연결/consolidated note; unit
+  from the 단위 hint just before the `<TABLE>`). `_sga_rd_series()` de-cumulates it
+  with the *same* `_to_discrete` machinery as the SGA total, and `quarterly()`
+  subtracts. Filers with R&D in COGS have no SG&A R&D row → nothing subtracted (SGA
+  unchanged). **Verified:** Hyundai (005380) 2025Q3 판관비 5,746,793 − R&D 640,577 =
+  **5,106,216** (₩M). Note: the SG&A R&D label was renamed 연구비→경상개발비 between the
+  2024 and 2025 filings — matched on 연구/개발 within the validated note, not a fixed label.
+  Consistency rule: once a year is known to carry R&D in SG&A, every quarter must be
+  R&D-excluded; a quarter whose R&D can't be recovered is DROPPED (no value) rather than
+  left R&D-inclusive. This happens for fabless filers like LX Semicon (108320) — R&D is
+  ~56% of its SG&A, and its ANNUAL report doesn't repeat the 급여-bearing functional
+  breakdown the interim reports use, so its Q4 SG&A is reported as no value (Q1–Q3 remain
+  correctly R&D-excluded). Hyundai's annual DOES repeat the breakdown, so all four
+  quarters resolve.
+- **Japan (no-value by user decision).** EDINET tags R&D-in-SG&A
+  (`jppfs_cor:ResearchAndDevelopmentExpensesSGA`, 一般管理費に含まれる研究開発費) **only in
+  the annual (and some half-year) securities report — never reliably per quarter**
+  (confirmed on Socionext, Tokyo Seimitsu, Mitsubishi Gas Chemical), so a clean
+  discrete-quarter subtraction like Korea's isn't derivable. Per the user's choice
+  ("no value over a wrong, R&D-inclusive value"), `EdinetSource.quarterly()` subtracts
+  R&D only for YTD points that actually disclose it and **drops** the rest — so JP
+  `SGA_EXPENSE` reports a value only where it can be correctly R&D-excluded, else
+  MISSING. In practice most/all JP quarters report no value. (JP SGA has no J-Quants
+  fallback, so this fully governs JP SGA.) No confirmed JP target yet — best-effort.
+
 ## Not done / next steps (roughly by value)
 
 1. ~~**Calibrate against real data**~~ **DONE** (see "Key assumptions" above).

@@ -247,6 +247,21 @@ _US_SGA_SPEC = {
                      ["GeneralAndAdministrativeExpense"]]},
 }
 
+# Finance-arm filers whose ACCOUNTS_RECEIVABLE — per the user's convention — is
+# automotive trade receivables (current) PLUS the captive financing subsidiary's
+# receivables (current portion only). Keyed by CIK -> the extra current
+# finance-receivable element local-name(s) SUMMED onto us-gaap:AccountsReceivableNetCurrent.
+# These lines live in the filing's XBRL instance rather than the companyconcept API
+# (GM Financial's is dimensioned on BusinessGroupAxis=GmFinancialMember; Ford
+# Credit's is an undimensioned face-statement line) — so they're pulled from the
+# instance via EdgarDimensional.instant_series. The matching NON-current finance
+# receivable is deliberately excluded (current portion only). Every other US filer
+# is unaffected and reports trade receivables alone.
+US_FINANCE_RECEIVABLE = {
+    "0001467858": ["NotesAndLoansReceivableNetCurrent"],   # GM   -> GM Financial receivables, net (current)
+    "0000037996": ["NotesAndLoansReceivableNetCurrent"],   # Ford -> Ford Credit finance receivables, net (current)
+}
+
 
 # ---- US: SEC EDGAR -------------------------------------------------------- #
 class EdgarSource(Source):
@@ -321,6 +336,14 @@ class EdgarSource(Source):
 
     def __init__(self):
         self._cik = {}
+        self._dim = None
+
+    def _dimensional(self) -> "EdgarDimensional":
+        """Lazily-built helper for reading facts straight from filing XBRL instances
+        (used for finance-arm receivable lines that never surface in companyconcept)."""
+        if self._dim is None:
+            self._dim = EdgarDimensional(self)
+        return self._dim
 
     def _resolve_cik(self, api_id: str) -> str | None:
         api_id = api_id.strip().upper()
@@ -489,7 +512,14 @@ class EdgarSource(Source):
         unit = "USD/shares" if CANONICAL[metric]["per_share"] else "USD"
         spec = (self._revenue_tag_order(cik) if metric == "REVENUE"
                 else self.metric_map[metric])
-        return self._resolve(cik, spec, kind, unit)
+        series = self._resolve(cik, spec, kind, unit)
+        # Finance-arm filers (GM, Ford): ACCOUNTS_RECEIVABLE = trade receivables +
+        # the captive-finance subsidiary's current receivables (from the instance).
+        if metric == "ACCOUNTS_RECEIVABLE" and cik in US_FINANCE_RECEIVABLE:
+            extra = self._dimensional().instant_series(
+                cik, US_FINANCE_RECEIVABLE[cik], years)
+            series = {k: v + extra.get(k, 0.0) for k, v in series.items()}
+        return series
 
     def frames(self, api_id, metric, fye_month=12, years=None):
         """All distinct as-reported vintages of each directly-filed period, so a
@@ -679,6 +709,77 @@ class EdgarDimensional:
                 days = (datetime.date.fromisoformat(e) - datetime.date.fromisoformat(s)).days
                 if 85 <= days <= 95:
                     out[cal_key_from_date(e)] = val
+        return out
+
+    def _instant_facts(self, cik, acc, doc):
+        """All point-in-time (instant) facts in a filing's XBRL instance, as
+        [local-name, end-date, dims, value]. Unlike `_facts` (segment/geo durations
+        only), this keeps arbitrary balance-sheet tags — including undimensioned
+        ones — so line items that never surface in the companyconcept API (e.g. a
+        captive-finance subsidiary's receivables) can be read directly."""
+        ck = f"edgar_inst_{acc}"
+        c = _cache_get(ck)
+        if c is not None:
+            return c
+        inst = doc[:-4] + "_htm.xml"
+        url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc.replace('-', '')}/{inst}"
+        facts = []
+        try:
+            r = SESSION.get(url, headers={"User-Agent": SEC_UA}, timeout=90)
+            r.raise_for_status()
+            root = ET.fromstring(r.content)
+            ctx = {}
+            for cc in root:
+                if _xloc(cc.tag) != "context":
+                    continue
+                dims, end, is_instant = {}, None, False
+                for x in cc.iter():
+                    l = _xloc(x.tag)
+                    if l == "explicitMember":
+                        dims[_xloc(x.get("dimension"))] = _xloc((x.text or "").strip())
+                    elif l == "instant":
+                        end = x.text
+                        is_instant = True
+                ctx[cc.get("id")] = (end, is_instant, dims)
+            for el in root.iter():
+                cr = el.get("contextRef")
+                if not cr or cr not in ctx:
+                    continue
+                end, is_instant, dims = ctx[cr]
+                if not is_instant or not end:
+                    continue
+                try:
+                    val = float(el.text)
+                except (TypeError, ValueError):
+                    continue
+                facts.append([_xloc(el.tag), end, dims, val])
+        except Exception:
+            pass
+        _cache_put(ck, facts)
+        return facts
+
+    def instant_series(self, cik, localnames, years):
+        """Discrete point-in-time series {(cal_year, cal_q): summed value} for the
+        given element local-names, read from each filing's balance-sheet instant.
+        For a given element at a given instant the fact with the FEWEST dimensions
+        is taken (the aggregate line, never a portfolio/segment sub-breakdown), then
+        the wanted elements are summed. Handles both undimensioned facts (Ford
+        Credit's line) and single-axis facts (GM Financial's BusinessGroupAxis)."""
+        want = set(localnames)
+        out = {}
+        for acc, doc in self._filings(cik, years):
+            best = {}   # (end, local-name) -> (n_dims, value)
+            for tag, end, dims, val in self._instant_facts(cik, acc, doc):
+                if tag not in want:
+                    continue
+                k = (end, tag)
+                if k not in best or len(dims) < best[k][0]:
+                    best[k] = (len(dims), val)
+            by_end = {}
+            for (end, tag), (_nd, val) in best.items():
+                by_end[end] = by_end.get(end, 0.0) + val
+            for end, total in by_end.items():
+                out[cal_key_from_date(end)] = total
         return out
 
 
@@ -950,7 +1051,99 @@ class OpenDartSource(Source):
             else:
                 for q, v in self._to_discrete(vals).items():
                     out[(year, q)] = v
+        # The user's SG&A EXCLUDES R&D, but Korean 판매비와관리비 INCLUDES the R&D
+        # portion (경상연구개발비/연구비, disclosed only in the notes). Subtract it so
+        # SGA_EXPENSE = 판관비 − R&D-in-SG&A. Filers who instead carry R&D in COGS
+        # have no SG&A R&D note row, so nothing is subtracted (SG&A unchanged).
+        if metric == "SGA_EXPENSE":
+            rd, drop = self._sga_rd_series(corp, year_range)
+            out = {k: v - rd.get(k, 0.0)
+                   for k, v in out.items() if k not in drop}
         return out
+
+    @staticmethod
+    def _sga_note_rd(text):
+        """R&D expense included in 판매비와관리비 (won), from the SG&A functional-
+        breakdown note in a periodic report. Returns the note's current-period column
+        for the R&D line (경상연구개발비 / 경상개발비 / 연구비, …) — discrete 3개월 in an
+        interim report, full-year in an annual — or None when the filer discloses no
+        SG&A R&D line (its R&D sits in COGS instead). The first qualifying table in
+        document order is the CONSOLIDATED (연결) note. Returned values share the same
+        cumulative-or-discrete basis across a year's reports, so they de-cumulate
+        exactly like the SG&A total via _to_discrete."""
+        for m in re.finditer(r"<TABLE\b", text, re.I):
+            ts = m.start()
+            te = text.find("</TABLE>", ts)
+            if te < 0:
+                continue
+            rows = _html_tables(text[ts:te + 8])
+            if not rows:
+                continue
+            t = rows[0]
+            # SG&A functional breakdown: carries the 판매비와관리비 total row and a
+            # 급여 (salaries) component row — distinguishes it from the income
+            # statement (판관비 as one P&L line, no components) and the R&D-activity
+            # note (no 판매비와관리비 total).
+            if not any(_seg_norm(c) == _seg_norm("판매비와관리비") for r in t for c in r):
+                continue
+            if not any("급여" in c for r in t for c in r):
+                continue
+            rd_row = None
+            for r in t:
+                labels = []
+                for c in r:
+                    if _kr_num(c) is not None:
+                        break
+                    labels.append(c)
+                lab = " ".join(labels)
+                if ("연구" in lab or "개발" in lab) and "무형자산" not in lab \
+                        and "개척" not in lab:
+                    rd_row = r
+                    break
+            if rd_row is None:
+                continue
+            mult = _unit_multiplier(text[max(0, ts - 500):ts])
+            nums = [n for n in (_kr_num(c) for c in rd_row) if n is not None]
+            if nums:
+                return nums[0] * mult
+        return None
+
+    def _sga_rd_series(self, corp, year_range):
+        """Returns (rd, drop): rd is {(cal_y, cal_q): R&D_won_within_SG&A} discrete
+        quarters to subtract from 판관비; drop is a set of (cal_y, cal_q) whose SG&A
+        must be reported as no value. The R&D line is read from each report's
+        판매비와관리비 note and de-cumulated with the same machinery as the SG&A total.
+
+        A filer with NO SG&A R&D line (its R&D sits in COGS) yields empty rd/drop —
+        SG&A is left unchanged. But once a year is known to carry R&D in SG&A (any
+        interim report discloses it), every quarter of that year must be R&D-excluded
+        to stay consistent; a quarter whose R&D can't be recovered — e.g. Q4 when the
+        annual report doesn't repeat the SG&A functional breakdown the interim reports
+        use — is added to `drop` (no value) rather than left R&D-inclusive (wrong)."""
+        rd, drop = {}, set()
+        for year in year_range:
+            vals = {}
+            for q, reprt in self.REPRT.items():
+                rc = self._rcept_for(corp, year, q)
+                if not rc:
+                    continue
+                try:
+                    v = self._sga_note_rd(self._dart_document(rc))
+                except Exception:
+                    v = None
+                if v is not None:
+                    vals[q] = v
+            if not vals:
+                continue                       # no R&D in SG&A -> leave SG&A alone
+            disc = self._to_discrete(vals)
+            for q, v in disc.items():
+                rd[(year, q)] = v
+            # this year carries R&D in SG&A; any quarter we couldn't derive an R&D
+            # value for can't be reliably R&D-excluded -> drop it.
+            for q in (1, 2, 3, 4):
+                if q not in disc:
+                    drop.add((year, q))
+        return rd, drop
 
     @staticmethod
     def _to_discrete(vals: dict) -> dict:
@@ -1998,6 +2191,34 @@ class EdinetSource(Source):
         _cache_put(ck, text)
         return text
 
+    # R&D expense INCLUDED IN SG&A (JGAAP element; 一般管理費に含まれる研究開発費). The
+    # user's SG&A excludes R&D, but Japanese 販管費 includes it — so where this line
+    # is disclosed we subtract it. EDINET discloses it only in the annual (and some
+    # half-year) securities report, never reliably per quarter, so most discrete
+    # quarters can't be R&D-excluded; those are dropped (reported no value) rather
+    # than returned with R&D still in — per the user's "no value over wrong value".
+    SGA_RD_ELEMENTS = ("ResearchAndDevelopmentExpensesSGA",)
+
+    def _flow_element(self, doc, localname_suffixes, is_annual):
+        """Value of the first consolidated fact whose element local-name ends with one
+        of `localname_suffixes`, at the flow (YTD / full-year) context — or None if
+        the report doesn't tag it."""
+        text = self._csv_text(doc)
+        rows = list(csv.reader(io.StringIO(text), delimiter="\t"))
+        hdr = rows[0]
+        eid, ctxi, vali = hdr.index("要素ID"), hdr.index("コンテキストID"), hdr.index("値")
+        ctx = "CurrentYearDuration" if is_annual else "CurrentYTDDuration"
+        for r in rows[1:]:
+            if len(r) <= vali or r[ctxi] != ctx:   # exact ctx excludes NonConsolidated
+                continue
+            ln = r[eid].split(":")[-1]
+            if any(ln.endswith(s) for s in localname_suffixes):
+                try:
+                    return float(r[vali])
+                except ValueError:
+                    return None
+        return None
+
     def _report_value(self, doc, metric, is_annual):
         text = self._csv_text(doc)
         rows = list(csv.reader(io.StringIO(text), delimiter="\t"))
@@ -2045,8 +2266,18 @@ class EdinetSource(Source):
         ytd = {}
         for pe_iso, (doc, is_annual) in docs.items():
             v = self._report_value(doc, metric, is_annual)
-            if v is not None:
-                ytd[pe_iso] = v
+            if v is None:
+                continue
+            if metric == "SGA_EXPENSE":
+                # exclude R&D to match the user's convention. Only a report that
+                # actually discloses R&D-in-SG&A yields a usable YTD point; one that
+                # doesn't is skipped, so the discrete quarter is reported as no value
+                # rather than R&D-inclusive (which would be wrong for the user).
+                rd = self._flow_element(doc, self.SGA_RD_ELEMENTS, is_annual)
+                if rd is None:
+                    continue
+                v = v - rd
+            ytd[pe_iso] = v
         if not ytd:
             return {}
         # group by fiscal year, index quarters, de-cumulate YTD -> discrete
