@@ -133,8 +133,14 @@ NONFINANCIAL_METRICS = {
     "NON_GAAP_REVENUE", "NONGAAP_GROSS_MARGIN", "ADJUSTED_OPERATING_MAFGIN",
     "ADJUSTED_OPERATING_MARGIN",
 }
+# Any adjusted / non-GAAP / pro-forma figure is a company-defined measure absent
+# from the audited statements (each filer picks its own add-backs, and it lives in
+# the 8-K earnings-release exhibit, not the GAAP XBRL) — so ADJUSTED*/PRO(_)FORMA*
+# join NON(_)GAAP* here. This also stops adjusted_* codes (e.g. adjusted_gross_margin)
+# from slipping through to NO_MAPPING, which wrongly implies "just add a mapping".
 _NONFIN_KEYWORDS = ("WAFER", "UTILIZATION", "BACKLOG", "BOOKING", "BOOK_TO_BILL",
                     "EMPLOYEE", "HEADCOUNT", "FX_RATE", "NON_GAAP", "NONGAAP",
+                    "NON-GAAP", "ADJUSTED", "PRO_FORMA", "PROFORMA", "PRO-FORMA",
                     "12INCH", "12_INCH")
 
 
