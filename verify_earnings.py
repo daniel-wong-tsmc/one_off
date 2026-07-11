@@ -2467,6 +2467,116 @@ class EdinetSource(Source):
                     return None
         return None
 
+    def _prior_report_value(self, doc, metric, is_annual):
+        """Value of `metric` at the report's PRIOR-year comparative context —
+        Prior1YearDuration (annual) / Prior1YTDDuration (quarterly YTD) for flows.
+        This is the period one fiscal year before `doc`'s own, as re-presented a
+        year later; comparing it with that period's as-originally-filed figure
+        surfaces restatements. Mirrors _report_value on the Prior1 context. Returns
+        None if the report doesn't tag the prior column for this element. Flow only
+        — a quarterly balance sheet's prior column is the prior fiscal YEAR-END, not
+        the prior same-quarter instant (Prior1QuarterInstant is absent), so stock
+        vintages are not extractable this way and are left to quarterly()."""
+        text = self._csv_text(doc)
+        rows = list(csv.reader(io.StringIO(text), delimiter="\t"))
+        hdr = rows[0]
+        eid, ctxi, vali = hdr.index("要素ID"), hdr.index("コンテキストID"), hdr.index("値")
+        elt = self.metric_map[metric]
+        cands = elt if isinstance(elt, list) else [elt]
+        ctx = "Prior1YearDuration" if is_annual else "Prior1YTDDuration"
+        vals = {}
+        for r in rows[1:]:
+            if r[ctxi] == ctx and "NonConsolidated" not in r[ctxi]:
+                vals.setdefault(r[eid], r[vali])
+        for c in cands:
+            if c in vals:
+                try:
+                    return float(vals[c])
+                except ValueError:
+                    return None
+        return None
+
+    def frames(self, api_id, metric, fye_month=12, years=None):
+        """Prior-year-comparative vintage of each period. Every EDINET securities/
+        quarterly report carries the previous fiscal year as a 前期 ("Prior1")
+        column — that period's figure as re-presented one year later. Where the
+        filer restated it, this differs from the period's own as-filed value
+        (quarterly()'s primary), so both vintages surface and a restatement can't be
+        silently overwritten.
+
+        Approach: for each report in the requested years (and the year after, whose
+        prior column covers the last requested year), read the Prior1 flow context
+        (Prior1YearDuration / Prior1YTDDuration), key it to the period one fiscal
+        year earlier, then de-cumulate that prior-year YTD ladder into discrete
+        quarters exactly as quarterly() does the current year.
+
+        Limits: FLOW metrics only — a quarterly balance sheet's comparative is the
+        prior fiscal year-end (not the prior same quarter), so stock vintages aren't
+        reliably locatable and return {}. SGA_EXPENSE is skipped: its user-
+        convention value subtracts R&D-in-SG&A, a split the prior column doesn't
+        expose, so it can't be reproduced without risking an R&D-inclusive (wrong)
+        figure. EPS is excluded as in quarterly(). Post-Apr-2024 EDINET dropped
+        quarterly (四半期) reports, so a fiscal year with only an annual filing
+        cannot de-cumulate its prior ladder and yields nothing there. Nothing is
+        emitted where the prior context/element is absent — never a guessed value.
+        Returns {(cal_y, cal_q): [restated_value]} for the requested years."""
+        if not self.available:
+            return {}
+        if metric not in self.metric_map or CANONICAL[metric]["kind"] == "stock":
+            return {}
+        if metric == "SGA_EXPENSE":
+            return {}
+        sec5 = api_id.strip()
+        if len(sec5) == 4:
+            sec5 += "0"
+        yrs = (sorted(set(int(y) for y in years)) if years
+               else list(range(2018, datetime.date.today().year + 1)))
+        # a period in year Y is the prior-year column of the report whose OWN
+        # period-end is in year Y+1, so discover those reports too.
+        disc_years = sorted(set(yrs) | {y + 1 for y in yrs})
+        docs = self._discover(sec5, fye_month, disc_years)
+        # read each report's prior-year YTD, keyed by the PRIOR period-end (same
+        # month, one year earlier), forming the prior fiscal year's YTD ladder.
+        prior_ytd = {}
+        for pe_iso, (doc, is_annual) in docs.items():
+            try:
+                v = self._prior_report_value(doc, metric, is_annual)
+            except Exception:
+                v = None
+            if v is None:
+                continue
+            pe = datetime.date.fromisoformat(pe_iso)
+            prior_pe = _month_last_day(pe.year - 1, pe.month)
+            prior_ytd[prior_pe.isoformat()] = v
+        if not prior_ytd:
+            return {}
+        # de-cumulate exactly like quarterly(): group by (prior) fiscal year,
+        # index quarters, subtract the preceding YTD rung.
+        from collections import defaultdict
+        groups = defaultdict(dict)
+        for pe_iso, v in prior_ytd.items():
+            pe = datetime.date.fromisoformat(pe_iso)
+            fye = _month_last_day(pe.year + (pe.month > fye_month), fye_month)
+            mdist = (fye.year - pe.year) * 12 + (fye.month - pe.month)
+            qidx = 4 - mdist // 3
+            groups[fye][qidx] = (pe, v)
+        out = {}
+        for q_map in groups.values():
+            for q in (1, 2, 3, 4):
+                if q not in q_map:
+                    continue
+                pe, v = q_map[q]
+                if q == 1:
+                    disc = v
+                elif (q - 1) in q_map:
+                    disc = v - q_map[q - 1][1]
+                else:
+                    continue                 # missing prior quarter -> can't derive
+                k = cal_key_from_date(pe.isoformat())
+                if k[0] in yrs:              # restrict to the requested years
+                    out[k] = [disc]
+        return out
+
     def quarterly(self, api_id, metric, fye_month=12, years=None):
         if not self.available:
             return {}
