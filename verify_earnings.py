@@ -86,6 +86,13 @@ CANONICAL = {
     "CAPEX":                        {"kind": "flow",  "per_share": False},
 }
 
+# Metrics whose API value is sign-flipped before comparing/reporting, to match the
+# user's file convention. The APIs report CAPEX as a positive cash amount
+# (us-gaap:PaymentsToAcquirePropertyPlantAndEquipment, CN 购建固定资产…), but the
+# user's files carry it as a negative (a cash OUTFLOW, e.g. -1,000), so we negate the
+# API figure so the signs line up (else every CAPEX row would falsely mismatch).
+SIGN_FLIP_METRICS = {"CAPEX"}
+
 # Derived / ratio metrics (margins, turnover days, cash-conversion cycle,
 # QoQ/YoY deltas). These are NOT a single as-filed line item — they are computed
 # from primitives with company-specific conventions (which denominator, discrete
@@ -2951,9 +2958,11 @@ def dump_reference(out_dir: Path, registry: dict, years, include_seg: bool = Fal
             except Exception as e:
                 print(f"     ! {metric}: {str(e)[:60]}", flush=True); continue
             ps = CANONICAL[metric]["per_share"]
+            sign = -1 if metric in SIGN_FLIP_METRICS else 1   # negative-CAPEX convention
             for (y, q), v in sorted(series.items()):
                 if y not in yset:
                     continue
+                v *= sign
                 faw.writerow({"company_id": cid, "fiscal_year": "",
                               "fiscal_quarter": "", "calendar_year": y,
                               "calendar_quarter": q, "financial_code": metric,
@@ -3070,9 +3079,12 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
     def get_series(src, comp, cid, metric):
         k = (comp["market"], comp["api_id"], metric)
         if k not in series_cache:
-            series_cache[k] = src.quarterly(
+            s = src.quarterly(
                 comp["api_id"], metric, comp["fye_month"],
                 years=years_by_company.get(cid))
+            if metric in SIGN_FLIP_METRICS:      # match the user's negative-CAPEX sign
+                s = {kk: -vv for kk, vv in s.items()}
+            series_cache[k] = s
         return series_cache[k]
 
     def get_frames(src, comp, cid, metric):
@@ -3081,9 +3093,12 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
         k = (comp["market"], comp["api_id"], metric)
         if k not in frames_cache:
             try:
-                frames_cache[k] = src.frames(
+                fr = src.frames(
                     comp["api_id"], metric, comp["fye_month"],
                     years=years_by_company.get(cid))
+                if metric in SIGN_FLIP_METRICS:
+                    fr = {kk: [-vv for vv in lst] for kk, lst in fr.items()}
+                frames_cache[k] = fr
             except Exception:
                 frames_cache[k] = {}
         return frames_cache[k]
