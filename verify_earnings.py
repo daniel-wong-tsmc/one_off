@@ -1245,6 +1245,84 @@ class OpenDartSource(Source):
                    for k, v in out.items() if k not in drop}
         return out
 
+    def frames(self, api_id, metric, fye_month=12, years=None):
+        """Restated (as-later-filed) vintages, recovered from the 전기 (prior-year)
+        comparative columns every DART report carries. A report for year Y+1 restates
+        period Y in its prior-year columns: on the income/CF statement interim reports
+        carry frmtrm_q_amount (3-month) and frmtrm_add_amount (YTD), the annual carries
+        frmtrm_amount (full year); on the balance sheet frmtrm_amount is the prior
+        YEAR-END balance. So reading year Y+1's reports yields a SECOND vintage of each
+        year-Y period — identical to quarterly()'s figure unless the filer restated it,
+        in which case run() surfaces both. Flow lines are de-cumulated from the frmtrm
+        columns with the SAME _flow_discrete/_to_discrete machinery quarterly() uses on
+        the thstrm columns; stock lines take the prior year-end balance as (Y,4).
+
+        Limits: comparatives expose only the immediately-preceding year, so just the
+        latest restatement of a period is seen (no full vintage chain), and interim
+        balance-sheet comparatives carry the prior YEAR-END only — restated interim
+        balances (Y,1..3) aren't recoverable, only (Y,4). Per the handoff rule a period
+        whose frmtrm columns are absent/ambiguous emits nothing: a false vintage would
+        cause a false MATCH, worse than no vintage. SGA_EXPENSE (adjusted by an R&D
+        note in quarterly()) has no clean frmtrm comparative, so no vintage is emitted."""
+        if not self.available:
+            return {}
+        corp = self._corp_map().get(api_id.strip())
+        if not corp:
+            return {}
+        # 판관비 is post-processed (R&D-in-SG&A subtracted from a note); the raw frmtrm
+        # comparative is R&D-inclusive and would differ from the primary for a benign
+        # reason -> a spurious differing vintage -> a false MATCH. Emit nothing.
+        if metric == "SGA_EXPENSE":
+            return {}
+        names, sj = self.metric_map[metric]
+        kind = CANONICAL[metric]["kind"]
+        if years:
+            year_range = sorted(set(int(y) for y in years))
+        else:
+            year_range = range(2015, datetime.date.today().year + 1)
+        out = {}
+        for year in year_range:
+            ny = year + 1                # reports that carry `year` as their 전기 column
+            if kind == "stock":
+                # prior year-end balance (전기말) restated in year+1's annual report.
+                data = self._fs(corp, ny, self.REPRT[4], "CFS")
+                v = self._val(data, names, sj, field="frmtrm_amount")
+                if v is None:
+                    data = self._fs(corp, ny, self.REPRT[4], "OFS")
+                    v = self._val(data, names, sj, field="frmtrm_amount")
+                if v is not None:
+                    out[(year, 4)] = [v]
+                continue
+            # flow: rebuild year `year`'s discrete series from year+1's frmtrm columns,
+            # mirroring quarterly() exactly but reading the prior-year fields. The period
+            # column is frmtrm_q_amount on interim reports and frmtrm_amount on the annual
+            # (which has no _q field); the cumulative column is frmtrm_add_amount.
+            vals, cum = {}, {}
+            for q, reprt in self.REPRT.items():
+                data = self._fs(corp, ny, reprt, "CFS")
+                v = self._val(data, names, sj, field="frmtrm_q_amount")
+                if v is None:
+                    v = self._val(data, names, sj, field="frmtrm_amount")
+                a = self._val(data, names, sj, field="frmtrm_add_amount")
+                if v is None and a is None:
+                    data = self._fs(corp, ny, reprt, "OFS")
+                    v = self._val(data, names, sj, field="frmtrm_q_amount")
+                    if v is None:
+                        v = self._val(data, names, sj, field="frmtrm_amount")
+                    a = self._val(data, names, sj, field="frmtrm_add_amount")
+                if v is not None:
+                    vals[q] = v
+                if a is not None:
+                    cum[q] = a
+            # need at least one interim quarter to de-cumulate: a lone full-year figure
+            # (annual frmtrm_amount only) can't be split into a Q4 discrete without the
+            # 9-month ladder, and _to_discrete would wrongly emit FY as Q4. Skip it.
+            if not any(q in vals for q in (1, 2, 3)):
+                continue
+            for q, v in self._flow_discrete(vals, cum).items():
+                out[(year, q)] = [v]
+        return out
+
     @staticmethod
     def _sga_note_rd(text):
         """R&D expense included in 판매비와관리비 (won), from the SG&A functional-
