@@ -1099,9 +1099,10 @@ class OpenDartSource(Source):
         # split (no NCI, where the two are equal). _val honours this priority even
         # though the total prints earlier in the statement. Total is NET_INCOME_INC_NCI.
         "NET_INCOME": (["지배기업의소유주에게귀속되는당기순이익",
-                        "지배기업의소유주에게귀속되는당기순이익(손실)",
+                        "지배기업의소유주에게귀속되는분기순이익",
+                        "지배기업의소유주에게귀속되는반기순이익",
                         "지배기업소유주지분순이익", "지배기업소유주지분",
-                        "당기순이익", "당기순이익(손실)", "연결당기순이익",
+                        "당기순이익", "연결당기순이익",
                         "연결분기순이익", "연결반기순이익", "분기순이익", "반기순이익"],
                        ("IS", "CIS")),
         "EPS_BASIC": (["기본주당이익", "기본주당이익(손실)", "기본주당순이익"], ("IS", "CIS")),
@@ -1167,23 +1168,30 @@ class OpenDartSource(Source):
         return _http_json("https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json?" + q,
                           cache_key=f"dart_{corp}_{year}_{reprt}_{fs_div}")
 
-    def _val(self, data, names, sj_divs):
+    @staticmethod
+    def _norm_acct(s: str) -> str:
+        """Normalize an account name for matching: drop all whitespace and a trailing
+        '(손실)'/'(손익)' loss/PL parenthetical, so a candidate like '분기순이익' matches
+        the filed row '분기순이익(손실)' (many filers append the loss suffix)."""
+        s = re.sub(r"\s", "", s or "")
+        return re.sub(r"\((손실|손익)\)$", "", s)
+
+    def _val(self, data, names, sj_divs, field="thstrm_amount"):
+        """Value of the first matching account line, from column `field`
+        (thstrm_amount = current 3-month/period; thstrm_add_amount = YTD cumulative).
+        Matching is in CANDIDATE-PRIORITY order (not statement order): a consolidated
+        statement lists BOTH 당기순이익 (total) and the 지배기업 소유주 귀속 line, total
+        first, so we prefer the earlier-listed candidate (parent). Whitespace and the
+        '(손실)' loss suffix are normalized away."""
         if not data or data.get("status") != "000":
             return None
-        # match account names in CANDIDATE-PRIORITY order (not statement order) and
-        # with all internal whitespace removed. Priority matters for net income: a
-        # consolidated statement lists BOTH 당기순이익 (total) and the
-        # 지배기업 소유주 귀속 당기순이익 (parent) line, with the total appearing first —
-        # so we must prefer the earlier-listed candidate (parent) rather than
-        # whichever row comes first. Whitespace stripping handles filer-specific
-        # spacing like '지배기업의 소유주에게 귀속되는 자본'.
         rows = data.get("list", [])
         for name in names:
-            want = re.sub(r"\s", "", name)
+            want = self._norm_acct(name)
             for row in rows:
-                nm = re.sub(r"\s", "", row.get("account_nm") or "")
+                nm = self._norm_acct(row.get("account_nm") or "")
                 if nm == want and row.get("sj_div") in sj_divs:
-                    raw = (row.get("thstrm_amount") or "").replace(",", "").strip()
+                    raw = (row.get(field) or "").replace(",", "").strip()
                     try:
                         return float(raw)
                     except ValueError:
@@ -1204,21 +1212,28 @@ class OpenDartSource(Source):
             year_range = range(2015, datetime.date.today().year + 1)
         out = {}
         for year in year_range:
-            vals = {}
+            vals = {}       # q -> current 3-month/period column (thstrm_amount)
+            cum = {}        # q -> YTD cumulative column (thstrm_add_amount), if filed
             for q, reprt in self.REPRT.items():
                 # consolidated preferred; fall back to separate if no value
-                v = self._val(self._fs(corp, year, reprt, "CFS"), names, sj)
-                if v is None:
-                    v = self._val(self._fs(corp, year, reprt, "OFS"), names, sj)
+                data = self._fs(corp, year, reprt, "CFS")
+                v = self._val(data, names, sj)
+                a = self._val(data, names, sj, field="thstrm_add_amount")
+                if v is None and a is None:
+                    data = self._fs(corp, year, reprt, "OFS")
+                    v = self._val(data, names, sj)
+                    a = self._val(data, names, sj, field="thstrm_add_amount")
                 if v is not None:
                     vals[q] = v
+                if a is not None:
+                    cum[q] = a
             if not vals:
                 continue
             if kind == "stock":
                 for q, v in vals.items():
                     out[(year, q)] = v
             else:
-                for q, v in self._to_discrete(vals).items():
+                for q, v in self._flow_discrete(vals, cum).items():
                     out[(year, q)] = v
         # The user's SG&A EXCLUDES R&D, but Korean 판매비와관리비 INCLUDES the R&D
         # portion (경상연구개발비/연구비, disclosed only in the notes). Subtract it so
@@ -1313,6 +1328,44 @@ class OpenDartSource(Source):
                 if q not in disc:
                     drop.add((year, q))
         return rd, drop
+
+    @classmethod
+    def _flow_discrete(cls, vals: dict, cum: dict) -> dict:
+        """Discrete quarters for a flow line. `vals` is the 3-month/period column
+        (thstrm_amount) per report quarter 1..4; `cum` is the YTD-cumulative column
+        (thstrm_add_amount) where the filer files one (interim reports only; the
+        annual has no cumulative column, its full-year figure is vals[4]).
+
+        When the cumulative column is available for any interim quarter we
+        de-cumulate from it DETERMINISTICALLY (Q_n = YTD_n − YTD_{n-1};
+        Q4 = FY − YTD_9M) instead of guessing whether the 3-month column is really
+        cumulative. This fixes back-loaded filers where the Q3 3-month figure happens
+        to be ~half the year (e.g. LX Semicon 2020: Q3 3-month 36,959 is 51% of the
+        annual, which the ratio heuristic misread as a 9-month cumulative — turning a
+        16,014 Q4 into 35,570). Falls back to the ratio-based `_to_discrete` on the
+        3-month column when no cumulative column was filed."""
+        if not any(q in cum for q in (1, 2, 3)):
+            return cls._to_discrete(vals)
+        fy = vals.get(4)
+        # cumulative ladder Q1..Q3: prefer the YTD column, fall back to the 3-month
+        # value only where the YTD column is missing for that quarter.
+        C = {}
+        for q in (1, 2, 3):
+            if q in cum:
+                C[q] = cum[q]
+            elif q in vals:
+                C[q] = vals[q]
+        out = {}
+        for q in (1, 2, 3):
+            if q not in C:
+                continue
+            if q == 1:
+                out[q] = C[q]
+            elif (q - 1) in C:                 # need the contiguous prior YTD to diff
+                out[q] = C[q] - C[q - 1]
+        if fy is not None and 3 in C:
+            out[4] = fy - C[3]                 # Q4 = full year − 9-month cumulative
+        return out
 
     @staticmethod
     def _to_discrete(vals: dict) -> dict:
