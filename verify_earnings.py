@@ -2968,11 +2968,12 @@ def dump_reference(out_dir: Path, registry: dict, years, include_seg: bool = Fal
                       seg_members, yset)
 
 
-def _mismatch_diff(rec):
-    """file_value - api_value for one result row, or None if either is unparseable.
-    Money metrics compare in millions (file_value vs api_value_millions); per-share
-    metrics leave api_value_millions blank, so api_value_local (already per-share)
-    is used instead."""
+def _mismatch_pct_diff(rec):
+    """Percentage difference (file_value - api_value) / api_value * 100 for one result
+    row, or None if either value is unparseable or api_value is 0 (no meaningful base).
+    Money metrics use millions (file_value vs api_value_millions); per-share metrics
+    leave api_value_millions blank, so api_value_local (already per-share) is used —
+    the ratio is unit-free either way."""
     try:
         fv = float(str(rec.get("file_value", "")).replace(",", ""))
     except (TypeError, ValueError):
@@ -2984,21 +2985,24 @@ def _mismatch_diff(rec):
         av = float(str(api).replace(",", ""))
     except (TypeError, ValueError):
         return None
-    return fv - av
+    if av == 0:
+        return None
+    return (fv - av) / av * 100.0
 
 
 def mismatch_code_summary(mism, out_dir):
     """Per-financial_code breakdown of the MISMATCH rows: how many times each unique
-    financial_code shows up as a mismatch, and the average (file_value - api_value)
-    difference across those rows. Rows whose values can't be parsed as numbers still
-    count toward the tally but are skipped from the average (n_with_diff = how many
-    rows the average is over). Writes mismatch_code_summary.csv; returns (rows, path)."""
+    financial_code shows up as a mismatch, and the average percentage difference
+    (file_value - api_value) / api_value across those rows. Rows whose values can't be
+    parsed (or whose api_value is 0) still count toward the tally but are skipped from
+    the average (n_with_diff = how many rows the average is over). Writes
+    mismatch_code_summary.csv; returns (rows, path)."""
     code_stats = {}
     for r in mism:
         st = code_stats.setdefault(r.get("financial_code", ""),
                                    {"count": 0, "diffs": []})
         st["count"] += 1
-        d = _mismatch_diff(r)
+        d = _mismatch_pct_diff(r)
         if d is not None:
             st["diffs"].append(d)
     code_rows = []
@@ -3008,11 +3012,11 @@ def mismatch_code_summary(mism, out_dir):
         avg = sum(diffs) / len(diffs) if diffs else ""
         code_rows.append({"financial_code": code, "mismatch_count": st["count"],
                           "n_with_diff": len(diffs),
-                          "avg_difference": round(avg, 3) if diffs else ""})
+                          "avg_pct_difference": round(avg, 3) if diffs else ""})
     codesum_csv = out_dir / "mismatch_code_summary.csv"
     with open(codesum_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["financial_code", "mismatch_count",
-                                          "n_with_diff", "avg_difference"])
+                                          "n_with_diff", "avg_pct_difference"])
         w.writeheader()
         for cr in code_rows:
             w.writerow(cr)
@@ -3023,14 +3027,13 @@ def print_mismatch_code_summary(code_rows):
     """Console rendering of the per-financial_code mismatch breakdown."""
     if not code_rows:
         return
-    print("\n=== MISMATCHES by financial_code (count + avg file-vs-api diff) ===")
-    print("  (avg_difference = mean(file_value - api_value); millions of local")
-    print("   currency for money metrics, per-share for EPS)")
-    print(f"  {'financial_code':32} {'count':>6} {'avg_difference':>16}")
+    print("\n=== MISMATCHES by financial_code (count + avg file-vs-api % diff) ===")
+    print("  (avg_pct_difference = mean((file_value - api_value) / api_value * 100))")
+    print(f"  {'financial_code':32} {'count':>6} {'avg_pct_difference':>20}")
     for cr in code_rows:
-        avg = cr["avg_difference"]
-        avg_s = f"{avg:,.3f}" if avg != "" else "n/a"
-        print(f"  {cr['financial_code']:32} {cr['mismatch_count']:>6} {avg_s:>16}")
+        avg = cr["avg_pct_difference"]
+        avg_s = f"{avg:,.3f}%" if avg != "" else "n/a"
+        print(f"  {cr['financial_code']:32} {cr['mismatch_count']:>6} {avg_s:>20}")
 
 
 def run(data_dir: Path, out_dir: Path, compare_col: str,
