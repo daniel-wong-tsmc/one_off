@@ -1255,7 +1255,11 @@ class FinMindSource(Source):
         "CURRENT_LIABILITIES": (BS, "CurrentLiabilities"),
         "TOTAL_LIABILITIES": (BS, "Liabilities"),
         "TOTAL_EQUITY": (BS, "Equity"),
-        "ACCOUNTS_RECEIVABLE": (BS, "AccountsReceivableNet"),
+        # trade receivables (應收帳款) + receivables from related parties
+        # (應收帳款-關係人); summed to match how providers/the user's data report
+        # "accounts receivable" — same convention as ACCOUNTS_PAYABLE above.
+        "ACCOUNTS_RECEIVABLE": (BS, {"sum": ["AccountsReceivableNet",
+                                             "AccountsReceivableDuefromRelatedPartiesNet"]}),
         "CASH_AND_CASH_EQUIVALENTS": (BS, "CashAndCashEquivalents"),
         "INVENTORIES": (BS, "Inventories"),
         "PROPERTY_PLANT_AND_EQUIPMENT": (BS, "PropertyPlantAndEquipment"),
