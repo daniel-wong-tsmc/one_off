@@ -2968,6 +2968,71 @@ def dump_reference(out_dir: Path, registry: dict, years, include_seg: bool = Fal
                       seg_members, yset)
 
 
+def _mismatch_diff(rec):
+    """file_value - api_value for one result row, or None if either is unparseable.
+    Money metrics compare in millions (file_value vs api_value_millions); per-share
+    metrics leave api_value_millions blank, so api_value_local (already per-share)
+    is used instead."""
+    try:
+        fv = float(str(rec.get("file_value", "")).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    api = rec.get("api_value_millions", "")
+    if api == "" or api is None:
+        api = rec.get("api_value_local", "")
+    try:
+        av = float(str(api).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    return fv - av
+
+
+def mismatch_code_summary(mism, out_dir):
+    """Per-financial_code breakdown of the MISMATCH rows: how many times each unique
+    financial_code shows up as a mismatch, and the average (file_value - api_value)
+    difference across those rows. Rows whose values can't be parsed as numbers still
+    count toward the tally but are skipped from the average (n_with_diff = how many
+    rows the average is over). Writes mismatch_code_summary.csv; returns (rows, path)."""
+    code_stats = {}
+    for r in mism:
+        st = code_stats.setdefault(r.get("financial_code", ""),
+                                   {"count": 0, "diffs": []})
+        st["count"] += 1
+        d = _mismatch_diff(r)
+        if d is not None:
+            st["diffs"].append(d)
+    code_rows = []
+    for code in sorted(code_stats, key=lambda c: (-code_stats[c]["count"], c)):
+        st = code_stats[code]
+        diffs = st["diffs"]
+        avg = sum(diffs) / len(diffs) if diffs else ""
+        code_rows.append({"financial_code": code, "mismatch_count": st["count"],
+                          "n_with_diff": len(diffs),
+                          "avg_difference": round(avg, 3) if diffs else ""})
+    codesum_csv = out_dir / "mismatch_code_summary.csv"
+    with open(codesum_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["financial_code", "mismatch_count",
+                                          "n_with_diff", "avg_difference"])
+        w.writeheader()
+        for cr in code_rows:
+            w.writerow(cr)
+    return code_rows, codesum_csv
+
+
+def print_mismatch_code_summary(code_rows):
+    """Console rendering of the per-financial_code mismatch breakdown."""
+    if not code_rows:
+        return
+    print("\n=== MISMATCHES by financial_code (count + avg file-vs-api diff) ===")
+    print("  (avg_difference = mean(file_value - api_value); millions of local")
+    print("   currency for money metrics, per-share for EPS)")
+    print(f"  {'financial_code':32} {'count':>6} {'avg_difference':>16}")
+    for cr in code_rows:
+        avg = cr["avg_difference"]
+        avg_s = f"{avg:,.3f}" if avg != "" else "n/a"
+        print(f"  {cr['financial_code']:32} {cr['mismatch_count']:>6} {avg_s:>16}")
+
+
 def run(data_dir: Path, out_dir: Path, compare_col: str,
         registry: dict, metric_map: dict, files_map: dict, seg_members: dict = None,
         mapping: dict = None, export: bool = False):
@@ -3246,6 +3311,8 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
         for r in mism:
             w.writerow({k: r.get(k, "") for k in cols})
 
+    code_rows, codesum_csv = mismatch_code_summary(mism, out_dir)
+
     # optional export: the API-fetched values written into YOUR file schema, so you
     # can diff it against your own files. financial_report_value = the as-filed value
     # (millions of local currency; per-share direct); financial_value (your FX-to-USD
@@ -3262,8 +3329,10 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
         print(f"  {st:22} {n}")
     print(f"\nFull results : {all_csv}")
     print(f"Mismatches   : {mm_csv}  ({len(mism)} rows)")
+    print(f"Mismatch code summary : {codesum_csv}")
     if export:
         print(f"Export (your schema, API values): {out_dir / 'export'}/")
+    print_mismatch_code_summary(code_rows)
     if mism:
         print("\n=== MISMATCHES (company / metric / period) ===")
         for r in mism:
@@ -3448,6 +3517,7 @@ def compare_against_reference(data_dir: Path, ref_dir: Path, out_dir: Path,
         w = csv.DictWriter(f, fieldnames=cols); w.writeheader()
         for r in mism:
             w.writerow({k: r.get(k, "") for k in cols})
+    code_rows, codesum_csv = mismatch_code_summary(mism, out_dir)
     from collections import Counter
     counts = Counter(r["status"] for r in results)
     print("\n=== Summary (offline vs reference, fuzzy-matched) ===")
@@ -3455,6 +3525,8 @@ def compare_against_reference(data_dir: Path, ref_dir: Path, out_dir: Path,
         print(f"  {st:22} {n}")
     print(f"\nFull results : {out_dir/'verification_results.csv'}")
     print(f"Mismatches   : {out_dir/'mismatches.csv'}  ({len(mism)} rows)")
+    print(f"Mismatch code summary : {codesum_csv}")
+    print_mismatch_code_summary(code_rows)
     for r in mism[:50]:
         print(f"  [{r['company_id']} {r['company_name']}] {r['financial_code']} "
               f"{r['segment_code'] or ''} {r['calendar_year']}Q{r['calendar_quarter']}: "
