@@ -149,6 +149,43 @@ Services)**. Every other US filer is untouched (trade only). **Verified:** GM 20
 11,721 + 6,427 = **18,148**; Cisco = 4,827 + 3,085 = **7,912**; HPE latest = 6,286 +
 3,694 = **9,980** (US$M) — all matching the as-filed balance sheets.
 
+### US DEPRECIATION_AND_AMORTIZATION = depreciation + amortization
+Total D&A (the cash-flow add-back). The spec now PREFERS a combined
+depreciation-and-amortization tag, ELSE **sums** `Depreciation` +
+`AmortizationOfIntangibleAssets`/`FiniteLivedIntangibleAssetsAmortizationExpense` —
+filers that split them (SWKS, QRVO) tag only the depreciation-only line, so taking
+it alone dropped amortization. Filers whose amortization is a **custom extension
+element** the companyconcept API can't serve are topped up from the filing instance
+via `US_CUSTOM_DA` + `EdgarDimensional.duration_series`: Silicon Labs
+(`slab:AmortizationOfIntangiblesAndOtherAssets`, "add") and Cisco
+(`csco:DepreciationAmortizationAndOther`, "replace" — its whole reported D&A;
+us-gaap alone returned nothing). **Verified:** SWKS 24Q3 68.5+46.9=**115.4**; SLAB
+25Q3 6.068+2.294=**8.362**; QRVO 26Q1 35.9+26.9=**62.7**; Cisco 25Q3 = **606** (was
+empty). Combined-tag filers (~17) are unchanged.
+
+### US OPERATING_EXPENSE = opex excluding COGS (accounting identity)
+`OPERATING_EXPENSE` is opex-ex-COGS = every operating-expense line between gross
+profit and operating income. The reported `OperatingExpenses` tag is trusted only
+when it's genuinely opex-ex-COGS; some filers tag their **TOTAL costs-and-expenses**
+under it (GM: 40,698 incl. cost of sales), detected by `OperatingExpenses ≈ Revenue −
+OperatingIncome`. In that case, or when there's no such tag (the old SG&A+R&D
+fallback, which misses restructuring/amortization/other opex lines — STX), the value
+is derived from the identity **opex = Revenue − COGS − OperatingIncome**, which
+captures every opex line regardless of (even custom-extension) tagging. COGS comes
+from companyconcept, or the filing instance for filers that tag it only at the
+business-group segment level (GM, via `duration_series(..., sum_dims=True)`).
+Guards: skip when gross profit ≤ 0, when the result is ≤ 0 (de-cumulation artifacts),
+or (for the SG&A+R&D fallback) when it would fall *below* that lower bound. Genuine
+`OperatingExpenses`-tag filers (ON Semi 354, Dell, …) are unchanged. **Verified:**
+GM 26Q1 = **5,670** (SG&A 2,069 + GM Financial opex 3,601); STX 25Q3 = **343** (SG&A
+144 + R&D 186 + restructuring 13); ON Semi 24Q3 stays 354. Broad effect: ~175 US
+opex rows now reflect full opex (JBL 291→446, NDSN, FLEX, …) instead of the SG&A+R&D
+undercount. **Known limitation:** GM's *derived* Q4 (annual − 9-month) still shows
+total-costs — de-cumulating GM's segment-level annual COGS is a follow-up; only the
+directly-filed quarters (incl. the flagged 2026Q1) are corrected. A couple of DELL
+Q4 `OperatingExpenses` values are negative in the source (pre-existing derived-Q4
+artifact in DELL's own tag) and are left as-is.
+
 ### SG&A excluding R&D — the user's convention (KR done, JP no-value)
 The user's SG&A **excludes** R&D (US ON Semi SGA = S&M + G&A, no R&D). KR 판매비와관리비
 and JP 販管費 both **include** R&D, so it must be subtracted.

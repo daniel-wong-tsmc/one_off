@@ -271,6 +271,22 @@ US_FINANCE_RECEIVABLE = {
     "0001645590": ["NotesAndLoansReceivableNetCurrent"],   # HPE   -> HPE Financial Services financing receivables, net (current; long-term portion excluded)
 }
 
+# Filers whose D&A (or its amortization component) is a company custom-extension
+# element the companyconcept API can't serve -> read it from the filing instance
+# (EdgarDimensional.duration_series, undimensioned) and SUM onto the us-gaap D&A
+# series. SLAB has us-gaap Depreciation but tags amortization as a custom line;
+# Cisco tags only a combined custom D&A line (its us-gaap D&A resolves empty, so
+# this supplies the whole figure). Keyed by CIK -> custom element local-name(s).
+US_CUSTOM_DA = {
+    # "add": SUM the custom element onto the us-gaap D&A series (filer tags a
+    #        separate amortization line as an extension).
+    # "replace": the custom element IS the filer's whole reported D&A add-back —
+    #        use it alone (the us-gaap series would be a partial component and would
+    #        double-count if added).
+    "0001038074": {"add": ["AmortizationOfIntangiblesAndOtherAssets"]},  # Silicon Labs: + amortization onto us-gaap Depreciation
+    "0000858877": {"replace": ["DepreciationAmortizationAndOther"]},     # Cisco: reported "Depreciation, amortization, and other"
+}
+
 
 # ---- US: SEC EDGAR -------------------------------------------------------- #
 class EdgarSource(Source):
@@ -333,9 +349,19 @@ class EdgarSource(Source):
         "SGA_EXPENSE": _US_SGA_SPEC,
         "TAX_EXPENSE": ["IncomeTaxExpenseBenefit"],
         "NET_INCOME_INC_NCI": ["ProfitLoss"],
-        "DEPRECIATION_AND_AMORTIZATION": ["DepreciationDepletionAndAmortization",
-                                          "DepreciationAmortizationAndAccretionNet",
-                                          "DepreciationAndAmortization", "Depreciation"],
+        # Total D&A (the cash-flow add-back). Prefer a filer's combined
+        # depreciation-AND-amortization tag; otherwise SUM depreciation + amortization
+        # of intangibles, since filers that split them (SWKS, QRVO) tag only the
+        # depreciation-only `Depreciation` line — taking it alone dropped the
+        # amortization. (Filers whose amortization is a custom extension element —
+        # SLAB, CSCO — are topped up from the filing instance via US_CUSTOM_DA below.)
+        "DEPRECIATION_AND_AMORTIZATION": {
+            "prefer": ["DepreciationDepletionAndAmortization",
+                       "DepreciationAmortizationAndAccretionNet",
+                       "DepreciationAndAmortization"],
+            "else": {"sum": [["Depreciation"],
+                             ["AmortizationOfIntangibleAssets",
+                              "FiniteLivedIntangibleAssetsAmortizationExpense"]]}},
         "CASH_FROM_OPERATION": [
             "NetCashProvidedByUsedInOperatingActivities",
             "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"],
@@ -528,6 +554,59 @@ class EdgarSource(Source):
             extra = self._dimensional().instant_series(
                 cik, US_FINANCE_RECEIVABLE[cik], years)
             series = {k: v + extra.get(k, 0.0) for k, v in series.items()}
+        # D&A with a custom-extension amortization/combined element (SLAB, CSCO):
+        # add the instance-read custom series (union of keys, since CSCO's us-gaap
+        # D&A series is empty and the custom line supplies the whole figure).
+        if metric == "DEPRECIATION_AND_AMORTIZATION" and cik in US_CUSTOM_DA:
+            cfg = US_CUSTOM_DA[cik]
+            if "replace" in cfg:                # custom element IS the whole D&A
+                series = self._dimensional().duration_series(cik, cfg["replace"], years)
+            else:                               # add the custom amortization component
+                extra = self._dimensional().duration_series(cik, cfg["add"], years)
+                series = {k: series.get(k, 0.0) + extra.get(k, 0.0)
+                          for k in set(series) | set(extra)}
+        # OPERATING_EXPENSE = opex EXCLUDING cost of sales. A reported OperatingExpenses
+        # tag is trusted only when it's genuinely opex-ex-COGS; some filers tag their
+        # TOTAL costs-and-expenses under it (GM), detectable as OperatingExpenses ≈
+        # Revenue − OperatingIncome. In that case, or when there is no such tag (the
+        # SG&A+R&D fallback, which misses other opex lines like restructuring — STX),
+        # derive it from the identity opex = Revenue − COGS − OperatingIncome, which
+        # captures every operating-expense line regardless of (even custom) tagging.
+        # COGS comes from companyconcept, or the filing instance for filers that tag
+        # it only at the business-group segment level (GM). Left unchanged where the
+        # identity's inputs (Revenue, OperatingIncome, COGS) aren't all available.
+        if metric == "OPERATING_EXPENSE" and series:
+            from_prefer = bool(self._resolve(cik, spec["prefer"], "flow", "USD"))
+            rev = self.quarterly(api_id, "REVENUE", fye_month, years)
+            oi = self.quarterly(api_id, "OPERATING_INCOME", fye_month, years)
+            cogs = self.quarterly(api_id, "COGS", fye_month, years)
+            cogs_dim = None
+            for k in list(series):
+                if k not in rev or k not in oi:
+                    continue
+                if from_prefer and abs(series[k] - (rev[k] - oi[k])) > 0.02 * abs(rev[k] or 1):
+                    continue                       # genuine reported opex-ex-COGS -> keep
+                c = cogs.get(k)
+                if c is None:                      # COGS tagged only at segment level
+                    if cogs_dim is None:
+                        cogs_dim = self._dimensional().duration_series(
+                            cik, ["CostOfGoodsAndServicesSold", "CostOfRevenue",
+                                  "CostOfGoodsSold"], years, sum_dims=True)
+                    c = cogs_dim.get(k)
+                if c is None or c > rev[k]:         # need a positive gross profit
+                    continue
+                newv = rev[k] - c - oi[k]
+                # Guard against de-cumulation artifacts: the identity relies on
+                # Revenue/COGS/OperatingIncome each de-cumulating consistently; when a
+                # restatement or vintage mismatch makes them disagree, it can go
+                # negative/absurd. Accept it only when positive, and — for the
+                # else-branch (SG&A+R&D was already a sane lower bound) — only when it
+                # doesn't fall BELOW that baseline (it must add opex lines, never drop).
+                if newv <= 0:
+                    continue
+                if not from_prefer and newv < series[k] - 0.005 * abs(rev[k]):
+                    continue
+                series[k] = newv
         return series
 
     def frames(self, api_id, metric, fye_month=12, years=None):
@@ -790,6 +869,80 @@ class EdgarDimensional:
             for end, total in by_end.items():
                 out[cal_key_from_date(end)] = total
         return out
+
+    def _duration_facts(self, cik, acc, doc):
+        """All period (duration) facts in a filing's XBRL instance, as
+        [local-name, start, end, dims, value]. The duration analogue of
+        `_instant_facts` — keeps arbitrary flow tags (income-statement / cash-flow
+        lines), including dimensioned ones and company custom-extension elements the
+        companyconcept API can't serve."""
+        ck = f"edgar_dur_{acc}"
+        c = _cache_get(ck)
+        if c is not None:
+            return c
+        inst = doc[:-4] + "_htm.xml"
+        url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc.replace('-', '')}/{inst}"
+        facts = []
+        try:
+            r = SESSION.get(url, headers={"User-Agent": SEC_UA}, timeout=90)
+            r.raise_for_status()
+            root = ET.fromstring(r.content)
+            ctx = {}
+            for cc in root:
+                if _xloc(cc.tag) != "context":
+                    continue
+                dims, s, e = {}, None, None
+                for x in cc.iter():
+                    l = _xloc(x.tag)
+                    if l == "explicitMember":
+                        dims[_xloc(x.get("dimension"))] = _xloc((x.text or "").strip())
+                    elif l == "startDate":
+                        s = x.text
+                    elif l == "endDate":
+                        e = x.text
+                ctx[cc.get("id")] = (s, e, dims)
+            for el in root.iter():
+                cr = el.get("contextRef")
+                if not cr or cr not in ctx:
+                    continue
+                s, e, dims = ctx[cr]
+                if not s or not e:
+                    continue
+                try:
+                    val = float(el.text)
+                except (TypeError, ValueError):
+                    continue
+                facts.append([_xloc(el.tag), s, e, dims, val])
+        except Exception:
+            pass
+        _cache_put(ck, facts)
+        return facts
+
+    def duration_series(self, cik, localnames, years, sum_dims=False):
+        """Discrete-quarter flow series {(cal_y, cal_q): value} for the given element
+        local-names, read from filing instances — for flow facts the companyconcept
+        API doesn't serve: a company custom-extension line (sum_dims=False → use the
+        undimensioned fact, e.g. Silicon Labs' amortization, Cisco's combined D&A) or
+        a line tagged only at the segment / business-group level (sum_dims=True →
+        take the undimensioned total if present, else sum across members, e.g. GM's
+        cost of sales). Collected per (start,end) across all filings, then handed to
+        the shared flow de-cumulator so both ~90d-discrete and YTD-ladder filers
+        de-cumulate exactly as the companyconcept path does."""
+        want = set(localnames)
+        raw = {}                       # (start, end) -> value
+        for acc, doc in self._filings(cik, years):
+            per = {}                   # (start, end) -> {dim-signature: value}
+            for tag, s, e, dims, val in self._duration_facts(cik, acc, doc):
+                if tag not in want:
+                    continue
+                if not sum_dims and dims:
+                    continue           # custom top-level line: undimensioned only
+                per.setdefault((s, e), {})[frozenset(dims.items())] = val
+            for key, sig in per.items():
+                raw[key] = sig[frozenset()] if frozenset() in sig else sum(sig.values())
+        facts = [{"start": s, "end": e, "val": v, "form": "10-Q"}
+                 for (s, e), v in raw.items()]
+        return EdgarSource._series_from_facts(facts, "flow")
 
 
 def load_segment_members(path: Path) -> dict:
