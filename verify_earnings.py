@@ -2865,6 +2865,35 @@ def compare_multi(file_val, api_locals, per_share):
     return status, a, api_m, False
 
 
+def _vfmt(x, per_share):
+    """Format one vintage value the way the note/columns do: raw for per-share,
+    millions (full local currency / 1e6) for money."""
+    return f"{x:.4f}" if per_share else f"{x / 1e6:.3f}"
+
+
+def vintage_columns(cand, primary, matched_local, matched, per_share):
+    """Transparency columns for one statement row. Returns
+    (api_vintages, vintage_match):
+      api_vintages  — every distinct candidate vintage, formatted like the note
+                      ("1445.000 / 1392.000"); a lone value is just that value.
+      vintage_match — "latest" if the file matched the primary/latest value,
+                      "superseded" if it matched an older value the company has
+                      since restated, "none" on MISMATCH, "" when not applicable
+                      (per-share, or a single vintage with nothing to supersede).
+    Superseded == matched a non-latest: matched and round(matched_local,2) !=
+    round(primary,2)."""
+    api_vintages = " / ".join(_vfmt(c, per_share) for c in cand)
+    if per_share:
+        return api_vintages, ""
+    if not matched:
+        return api_vintages, "none"
+    if len(cand) <= 1:
+        return api_vintages, ""
+    return api_vintages, ("superseded"
+                          if round(matched_local, 2) != round(primary, 2)
+                          else "latest")
+
+
 def export_files(export_dir: Path, results: list, files_map: dict):
     """Write the API-fetched values back out in the user's own CSV schema (one file
     per input file, ';'-delimited), so they can diff it against their originals.
@@ -3289,6 +3318,11 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
                         rec["api_value_local"] = api_local
                         rec["api_value_millions"] = round(api_m, 3)
                         rec["status"] = status
+                        # single dimensional value: no restatement vintages exist,
+                        # but keep the columns consistent across all rows
+                        rec["api_vintages"] = _vfmt(api_local, False)
+                        rec["vintage_match"] = ("latest" if status == "MATCH"
+                                                else "none")
                     except Exception as e:
                         rec["status"] = "ERROR"; rec["note"] = str(e)[:120]
                     results.append(rec); continue
@@ -3352,16 +3386,25 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
                     rec["api_value_local"] = matched_local
                     rec["api_value_millions"] = "" if per_share else round(api_m, 3)
                     rec["status"] = status
+                    rec["api_vintages"], rec["vintage_match"] = vintage_columns(
+                        cand, primary, matched_local, matched, per_share)
                     if len(cand) > 1:             # surface both vintages
-                        def _disp(x):
-                            return f"{x:.4f}" if per_share else f"{x / 1e6:.3f}"
-                        rec["note"] = (
-                            f"{len(cand)} EDGAR vintages for this period "
-                            f"(as-filed vs restated): "
-                            + " / ".join(_disp(c) for c in cand)
-                            + ("" if per_share else " (millions)")
-                            + (f"; file matches {_disp(matched_local)}" if matched
-                               else "; file matches none"))
+                        if (matched and not per_share
+                                and round(matched_local, 2) != round(primary, 2)):
+                            # MATCH against a superseded vintage: the file is an
+                            # as-filed value the company has since restated.
+                            rec["note"] = (
+                                f"matches as-filed {_vfmt(matched_local, per_share)}; "
+                                f"restated since to {_vfmt(primary, per_share)}"
+                                + ("" if per_share else " (millions)"))
+                        else:
+                            rec["note"] = (
+                                f"{len(cand)} filed vintages for this period "
+                                f"(as-filed vs restated): "
+                                + " / ".join(_vfmt(c, per_share) for c in cand)
+                                + ("" if per_share else " (millions)")
+                                + (f"; file matches {_vfmt(matched_local, per_share)}"
+                                   if matched else "; file matches none"))
                 except Exception as e:
                     rec["status"] = "ERROR"; rec["note"] = str(e)[:120]
                 results.append(rec)
@@ -3369,7 +3412,7 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
     # write outputs
     cols = ["file", "company_id", "company_name", "calendar_year", "calendar_quarter",
             "financial_code", "segment_code", "file_value", "api_value_local",
-            "api_value_millions", "status", "note"]
+            "api_value_millions", "api_vintages", "vintage_match", "status", "note"]
     all_csv = out_dir / "verification_results.csv"
     with open(all_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols); w.writeheader()
