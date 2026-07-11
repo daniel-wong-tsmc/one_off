@@ -617,14 +617,17 @@ class EdgarSource(Source):
         return series
 
     def frames(self, api_id, metric, fye_month=12, years=None):
-        """All distinct as-reported vintages of each directly-filed period, so a
-        restated quarter surfaces alongside the as-originally-filed one instead of
-        the latest silently overwriting it. E.g. Dell CY2021Q3 COGS: $20,335M as
-        first filed (incl. VMware) and $20,890M as later restated to continuing
-        operations after the Nov-2021 spin-off — both are returned. Covers only
-        directly-reported facts (~90d discrete quarters and point-in-time balances)
-        — the quarter where a company files two figures; derived Q4/YTD-ladder
-        values aren't 'vintages' and are left to quarterly()."""
+        """All distinct as-reported vintages of each period, so a restated value
+        surfaces alongside the as-originally-filed one instead of the latest
+        silently overwriting it. E.g. Dell CY2021Q3 COGS: $20,335M as first filed
+        (incl. VMware) and $20,890M as later restated to continuing operations
+        after the Nov-2021 spin-off — both are returned. Covers directly-reported
+        facts (~90d discrete quarters and point-in-time balances) AND the DERIVED
+        Q4 (= full-year − nine-month), which likewise carries multiple vintages
+        when a filer restates its full-year or nine-month cumulative across filings
+        (Dell restates Q4/annual net income, pre-tax income and revenue between the
+        Q3 10-Q, the 10-K and later proxies). Q1–Q3 YTD-ladder rungs aren't
+        versioned here and are left to quarterly()'s primary."""
         cik = self._resolve_cik(api_id)
         if not cik:
             return {}
@@ -666,6 +669,59 @@ class EdgarSource(Source):
                 e = datetime.date.fromisoformat(x["end"])
                 if 80 <= (e - s).days <= 100:
                     vals[cal_key_from_date(x["end"])].append(float(x["val"]))
+        # Derived-Q4 vintages: when a filer restates the full-year (FY) or the
+        # nine-month (9M) cumulative across filings, the DERIVED Q4 (= FY − 9M —
+        # what quarterly() falls back to when no discrete "three-months-ended-FYE"
+        # frame is filed) inherits multiple as-filed vintages the ~90d discrete
+        # pass above cannot see, so a restated Q4 would otherwise falsely MISMATCH
+        # (Dell restates its FY/9M net income, pre-tax income and revenue between
+        # the Q3 10-Q, the 10-K and later proxies). Off the SAME tag, group the FY
+        # (~350–380d) and 9M (~260–285d) frames by their shared fiscal-year start
+        # and, for each year where BOTH legs exist, add every (FY_vintage −
+        # 9M_vintage) as a Q4 candidate — never fabricate a Q4 from a single leg.
+        # Merged into `vals`, so the discrete as-filed Q4 (quarterly()'s primary
+        # when it files one) stays first and exact repeats collapse below. Flow
+        # only; balances have no such derivation.
+        if kind != "stock":
+            # A later filing routinely re-presents a prior FY/9M at coarser
+            # rounding (SWKS $226.585M -> $226.600M); such immaterial revisions
+            # are the SAME vintage, so treat leg values — and derived candidates
+            # vs. what's already collected — that agree within 0.1% as equal. That
+            # is far below the 1% reconciliation tolerance (so matching is
+            # unaffected), yet real restatements (Dell's are >=0.3%) survive as
+            # distinct Q4 vintages instead of drowning in rounding noise.
+            REL = 1e-3
+            def _distinct(vs):
+                keep = []
+                for v in vs:
+                    if not any(abs(v - u) <= REL * max(abs(v), abs(u), 1.0)
+                               for u in keep):
+                        keep.append(v)
+                return keep
+            fy_by_start, nm_by_start = defaultdict(list), defaultdict(list)
+            for x in facts:
+                if not (x.get("start") and x.get("end")):
+                    continue
+                s = datetime.date.fromisoformat(x["start"])
+                days = (datetime.date.fromisoformat(x["end"]) - s).days
+                if 350 <= days <= 380:
+                    fy_by_start[x["start"]].append((x["end"], float(x["val"])))
+                elif 260 <= days <= 285:
+                    nm_by_start[x["start"]].append(float(x["val"]))
+            for start, fy_lst in fy_by_start.items():
+                nm_lst = nm_by_start.get(start)
+                if not nm_lst:                    # need BOTH legs for a real Q4
+                    continue
+                fy_end = fy_lst[0][0]             # FYE fixed per year across vintages
+                q4_key = cal_key_from_date(fy_end)
+                bucket = vals[q4_key]             # discrete as-filed Q4 (if any) first
+                nm_v = _distinct(list(nm_lst))
+                for fv in _distinct([v for _, v in fy_lst]):
+                    for nv in nm_v:
+                        cand = fv - nv
+                        if not any(abs(cand - u) <= REL * max(abs(cand), abs(u), 1.0)
+                                   for u in bucket):
+                            bucket.append(cand)
         out = {}
         for k, lst in vals.items():
             seen, distinct = set(), []
