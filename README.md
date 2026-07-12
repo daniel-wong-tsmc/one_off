@@ -23,7 +23,7 @@ set -a; source .env; set +a   # export the vars
 
 ## Configure your companies and metrics
 
-Two small CSVs under `config/` drive everything:
+Small CSVs under `config/` drive everything:
 
 - **`config/company_registry.csv`** — map each `company_id` (from your
   `company_id_mapping` file) to its market and API id:
@@ -38,6 +38,10 @@ Two small CSVs under `config/` drive everything:
   Computed ratios/subtotals are routed to `UNSUPPORTED_DERIVED`, and operational
   or non-GAAP KPIs (headcount, wafer volume/ASP, utilization, backlog, FX, …) to
   `UNSUPPORTED_NONFINANCIAL`, so neither is mistaken for an un-mapped code.
+- **`config/completeness_exclude.csv`** *(optional)* — extra `financial_code`
+  values `--check-completeness` should not flag as missing (`*`/`?` globs allowed).
+  Additive to the built-in derived/operational exclusions. See
+  [Find missing values](#find-missing-values-in-your-own-data-completeness-check).
 
 Your **`company_id_mapping`** file (`company_id;external_mapped_name`) is picked
 up automatically from `--data-dir` (a `.csv` suffix is optional; override the
@@ -60,6 +64,39 @@ python verify_earnings.py --data-dir ./data --out-dir ./out --export
 # quick live check against 6 known-good companies (US/KR/TW/JP + TSMC & Acer TW seg/geo):
 python verify_earnings.py --self-test
 ```
+
+### Find missing values in your own data (completeness check)
+
+Reconciliation only compares rows you *have* — a value that's simply absent never
+surfaces, because there's nothing to compare. `--check-completeness` finds those
+holes. It's offline (no API) and analyses your FA file only:
+
+```bash
+python verify_earnings.py --data-dir ./data --out-dir ./out --check-completeness
+```
+
+It takes the **universe of every distinct `financial_code` in your data**, drops the
+ones that shouldn't be flagged, and checks that each company has every remaining code
+for every quarter it reports. Writes `out/missing_values.csv`, one row per missing
+`(company, quarter, financial_code)`, each tagged with a **`scope`**:
+
+| `scope` | Meaning | Signal |
+|---------|---------|--------|
+| `gap` | the company reports this code in **other** quarters but not this one | **high — a real hole** |
+| `not_reported_by_company` | the code exists in the dataset but this company reports it in **no** quarter | low — maybe legitimately not disclosed |
+| `quarter_missing` | an **entire** quarter inside the company's first→last span has no rows (only with `--fill-quarter-gaps`) | high |
+
+Filter to `scope == gap` for the genuine per-quarter holes; `not_reported_by_company`
+is informational (a company that never reports, say, `EPS_DILUTED` isn't a data error).
+Add `--fill-quarter-gaps` to also flag quarters that are missing wholesale (not just
+codes missing within quarters that exist).
+
+**What's excluded automatically:** derived metrics (margins, turnover days, any
+`*_QOQ`/`*_YOY`) and operational KPIs / non-GAAP figures — `WAFER_ASP`, `WAFER_SALES`
+(and variants), `UTILIZATION`, `BILLING_12INCH`, `BACKLOG`, `ADJUSTED_*`, … — via the
+same built-in classification the verifier uses. Add your own via
+`config/completeness_exclude.csv` (one `financial_code` per row; `*`/`?` globs allowed,
+e.g. `WAFER_*`, `*12INCH`).
 
 ### Pull a standalone reference, then fuzzy-match offline
 

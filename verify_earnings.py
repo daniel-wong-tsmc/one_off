@@ -4253,6 +4253,177 @@ def compare_against_reference(data_dir: Path, ref_dir: Path, out_dir: Path,
 
 
 # --------------------------------------------------------------------------- #
+# Completeness check — find (company, quarter, financial_code) rows MISSING from
+# the user's own data (a value that is simply absent, so it never surfaces as a
+# MATCH/MISMATCH because there is no row to compare).
+# --------------------------------------------------------------------------- #
+def load_completeness_excludes(path: Path):
+    """Optional config/completeness_exclude.csv of financial_codes that should NOT
+    be flagged when absent (operational KPIs, filer-specific lines, …). One
+    `financial_code` per row; a value containing '*' or '?' is treated as a
+    case-insensitive glob (e.g. `WAFER_*`, `*_YTD`). '#'-comment and header rows
+    are skipped. Returns (exact_upper_set, glob_pattern_list). This is ADDITIVE to
+    the built-in derived/non-financial classification, which already excludes
+    ratios/deltas and operational KPIs (WAFER*, UTILIZATION, *12INCH, BACKLOG, …)."""
+    exact, globs = set(), []
+    if not path.exists():
+        return exact, globs
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            code = (row.get("financial_code") or "").strip()
+            if not code or code.startswith("#") or code.lower() == "financial_code":
+                continue
+            if "*" in code or "?" in code:
+                globs.append(code.upper())
+            else:
+                exact.add(code.upper())
+    return exact, globs
+
+
+def _q_ordinal(cy, cq):
+    """Quarter as a single ordinal (year*4 + quarter-1) for span arithmetic, or
+    None if the year/quarter don't parse to a calendar quarter."""
+    try:
+        y, q = int(cy), int(cq)
+    except (TypeError, ValueError):
+        return None
+    if not 1 <= q <= 4:
+        return None
+    return y * 4 + (q - 1)
+
+
+def check_completeness(data_dir: Path, out_dir: Path, registry: dict,
+                       metric_map: dict, mapping: dict = None,
+                       extra_excludes=None, fill_gaps: bool = False):
+    """Report every (company, quarter, financial_code) combination that is ABSENT
+    from the user's FA file. The universe of codes is every distinct financial_code
+    that appears anywhere in the data, MINUS the ones that shouldn't be flagged:
+    derived ratios/deltas (is_derived_code), operational KPIs / non-GAAP figures
+    (is_nonfinancial_code — WAFER_ASP/WAFER_SALES*/UTILIZATION/*12INCH/…), and any
+    custom entry in config/completeness_exclude.csv.
+
+    Each missing row is tagged with a `scope`:
+      - `gap`                      the company DOES report this code in other
+                                   quarters but not this one — a genuine hole.
+      - `not_reported_by_company`  the code exists in the dataset but this company
+                                   reports it in NO quarter (maybe legitimately not
+                                   disclosed, maybe should be excluded).
+      - `quarter_missing`          (only with fill_gaps) an entire quarter inside
+                                   the company's first→last span has no rows at all.
+    Writes missing_values.csv; returns the list of missing-row dicts."""
+    from collections import defaultdict
+    mapping = mapping or {}
+    out_dir.mkdir(parents=True, exist_ok=True)
+    excl_exact, excl_globs = extra_excludes or (set(), [])
+    import fnmatch
+
+    fpath = resolve_data_file(data_dir, DEFAULT_FILES["FA"])
+    if not fpath.exists():
+        print(f"completeness: no FA file at {fpath}")
+        return []
+
+    all_codes = set()
+    company_quarters = defaultdict(set)          # cid -> {(cy,cq)}
+    present = defaultdict(set)                    # (cid,cy,cq) -> {code}
+    company_codes = defaultdict(set)             # cid -> {code reported in ANY q}
+    with open(fpath, encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f, delimiter=";"):
+            cid = (row.get("company_id") or "").strip()
+            cy = (row.get("calendar_year") or "").strip()
+            cq = (row.get("calendar_quarter") or "").strip()
+            code = (row.get("financial_code") or "").strip()
+            if not cid or not code or _q_ordinal(cy, cq) is None:
+                continue
+            all_codes.add(code)
+            company_quarters[cid].add((cy, cq))
+            present[(cid, cy, cq)].add(code)
+            company_codes[cid].add(code)
+
+    def excluded(code):
+        canonical = metric_map.get(code)
+        if is_derived_code(code, canonical) or is_nonfinancial_code(code, canonical):
+            return True
+        c = code.upper()
+        return c in excl_exact or any(fnmatch.fnmatch(c, g) for g in excl_globs)
+
+    universe = sorted(c for c in all_codes if not excluded(c))
+    excluded_codes = sorted(all_codes - set(universe))
+
+    def name_of(cid):
+        return registry.get(cid, {}).get("name") or mapping.get(cid, "")
+
+    def qkey(cid):                               # numeric company sort when possible
+        try:
+            return (0, int(cid))
+        except ValueError:
+            return (1, cid)
+
+    missing = []
+    for cid in sorted(company_quarters, key=qkey):
+        obs = company_quarters[cid]
+        obs_ords = {_q_ordinal(cy, cq): (cy, cq) for cy, cq in obs}
+        if fill_gaps:
+            lo, hi = min(obs_ords), max(obs_ords)
+            span = [o for o in range(lo, hi + 1)]
+        else:
+            span = sorted(obs_ords)
+        creported = company_codes[cid]
+        for o in span:
+            if o in obs_ords:
+                cy, cq = obs_ords[o]
+            else:                                # whole quarter absent (fill_gaps)
+                cy, cq = str(o // 4), str(o % 4 + 1)
+                missing.append({"company_id": cid, "company_name": name_of(cid),
+                                "calendar_year": cy, "calendar_quarter": cq,
+                                "financial_code": "<ALL>", "scope": "quarter_missing",
+                                "note": f"no rows at all for {cy}Q{cq} "
+                                        f"(company reports {len(universe)} codes)"})
+                continue
+            have = present[(cid, cy, cq)]
+            for code in universe:
+                if code in have:
+                    continue
+                scope = "gap" if code in creported else "not_reported_by_company"
+                missing.append({"company_id": cid, "company_name": name_of(cid),
+                                "calendar_year": cy, "calendar_quarter": cq,
+                                "financial_code": code, "scope": scope,
+                                "note": ("reported in other quarters, missing here"
+                                         if scope == "gap"
+                                         else "never reported by this company")})
+
+    cols = ["company_id", "company_name", "calendar_year", "calendar_quarter",
+            "financial_code", "scope", "note"]
+    out_csv = out_dir / "missing_values.csv"
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols); w.writeheader()
+        for r in missing:
+            w.writerow(r)
+
+    from collections import Counter
+    by_scope = Counter(r["scope"] for r in missing)
+    print("\n=== Data completeness (missing rows in your FA file) ===")
+    print(f"  universe: {len(universe)} financial_code(s) checked per company-quarter")
+    if excluded_codes:
+        print(f"  excluded (not flagged): {', '.join(excluded_codes)}")
+    print(f"  companies: {len(company_quarters)}  |  total missing rows: {len(missing)}")
+    for scope in ("gap", "quarter_missing", "not_reported_by_company"):
+        if by_scope.get(scope):
+            print(f"    {scope:24} {by_scope[scope]}")
+    gaps = [r for r in missing if r["scope"] == "gap"]
+    if gaps:
+        gap_by_code = Counter(r["financial_code"] for r in gaps)
+        print("  top gap codes (reported elsewhere but missing in some quarter):")
+        for code, n in gap_by_code.most_common(15):
+            print(f"    {code:32} {n}")
+        print("  sample gaps:")
+        for r in gaps[:25]:
+            print(f"    [{r['company_id']} {r['company_name']}] "
+                  f"{r['calendar_year']}Q{r['calendar_quarter']} {r['financial_code']}")
+    print(f"\nMissing-values report -> {out_csv}")
+    return missing
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 DEFAULT_FILES = {
@@ -4294,6 +4465,16 @@ def main():
                     help="compare your --data-dir files against a pulled reference "
                          "dir (offline, no API calls) with fuzzy label matching, "
                          "e.g. --reference ./out/reference")
+    ap.add_argument("--check-completeness", action="store_true",
+                    help="find (company, quarter, financial_code) rows MISSING from "
+                         "your own FA file (offline, no API). Writes "
+                         "<out-dir>/missing_values.csv. Derived/operational codes are "
+                         "excluded automatically; add more in "
+                         "config/completeness_exclude.csv")
+    ap.add_argument("--fill-quarter-gaps", action="store_true",
+                    help="with --check-completeness, also flag entire quarters that "
+                         "are absent inside a company's first->last span (not just "
+                         "missing codes within quarters that exist)")
     args = ap.parse_args()
 
     cfg = Path(args.config_dir)
@@ -4312,6 +4493,12 @@ def main():
         lo, hi = (int(x) for x in args.dump_years.split("-"))
         dump_reference(Path(args.out_dir), registry, range(lo, hi + 1),
                        include_seg=args.dump_seg, seg_members=seg_members)
+        return
+    if args.check_completeness:
+        excludes = load_completeness_excludes(cfg / "completeness_exclude.csv")
+        check_completeness(Path(args.data_dir), Path(args.out_dir), registry,
+                           metric_map, mapping, extra_excludes=excludes,
+                           fill_gaps=args.fill_quarter_gaps)
         return
     if args.reference:
         compare_against_reference(Path(args.data_dir), Path(args.reference),

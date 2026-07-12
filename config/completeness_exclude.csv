@@ -1,0 +1,22 @@
+financial_code
+# Extra financial_code values that should NOT be flagged as "missing" by
+# --check-completeness (in addition to the built-in exclusions). Use this for
+# operational KPIs and filer-specific lines that only some companies report, so
+# their absence in a given company-quarter is expected, not a data gap.
+#
+# One financial_code per row. A value containing '*' or '?' is a case-insensitive
+# glob, so a single pattern covers every variation:
+#   WAFER_*        -> WAFER_ASP, WAFER_SALES, WAFER_SALES_USD, WAFER_SALES_TWD_YTD
+#   *12INCH        -> BILLING_12INCH, CAPACITY_12INCH, BILLING 12INCH
+#
+# NOTE: the codes below are ALREADY excluded by the built-in classification
+# (is_nonfinancial_code / is_derived_code covers WAFER*, UTILIZATION, *12INCH,
+# BACKLOG, ratios, *_QOQ/_YOY, ADJUSTED/NON_GAAP, …). They are listed here only as
+# explicit, self-documenting examples and as belt-and-suspenders. Add your own
+# codes beneath them.
+BILLING_12INCH
+BILLING 12INCH
+UTILIZATION
+WAFER_*
+WAFER_ASP
+WAFER_SALES
