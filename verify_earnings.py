@@ -2032,8 +2032,94 @@ class FinMindSource(Source):
             out = {cal_key_from_date(r["date"]): float(r["value"])
                    for r in rows if r.get("type") == t}
             if out:
+                # Pre-IPO / recently-listed filers whose first interim filing was
+                # the 半年報 (H1) are MISSING earlier quarters from FinMind (Q1),
+                # so FinMind can't de-cumulate the first available quarter of that
+                # year — its value stays a year-start CUMULATIVE (H1 = Jan–Jun),
+                # not the discrete quarter, over-reporting that cell ~2x. Repair
+                # flow metrics; balance-sheet (stock) items are point-in-time and
+                # are never cumulative, so they're left untouched.
+                if CANONICAL[metric]["kind"] == "flow":
+                    out = self._fix_leading_cumulative(out, metric,
+                                                       api_id.strip())
                 return out
         return {}
+
+    def _month_revenue(self, sid):
+        """Independent, genuinely-discrete monthly revenue (TaiwanStockMonthRevenue).
+        Returns {(year, month): revenue}. Note FinMind's `date` is the ANNOUNCE
+        month (period+1), so key off revenue_year/revenue_month, the real period."""
+        q = {"dataset": "TaiwanStockMonthRevenue", "data_id": sid,
+             "start_date": "2010-01-01",
+             "end_date": datetime.date.today().isoformat()}
+        if self.token:
+            q["token"] = self.token
+        url = "https://api.finmindtrade.com/api/v4/data?" + urllib.parse.urlencode(q)
+        d = _http_json(url, cache_key=f"finmind_TaiwanStockMonthRevenue_{sid}")
+        out = {}
+        if d and d.get("status") == 200:
+            for r in d.get("data", []):
+                try:
+                    out[(int(r["revenue_year"]), int(r["revenue_month"]))] = \
+                        float(r["revenue"])
+                except (TypeError, ValueError, KeyError):
+                    pass
+        return out
+
+    @staticmethod
+    def _q_months(q):
+        """Calendar months (1-based) of quarter q, e.g. Q2 -> (4, 5, 6)."""
+        return range((q - 1) * 3 + 1, q * 3 + 1)
+
+    def _fix_leading_cumulative(self, out, metric, sid):
+        """Repair the leading-cumulative artifact for pre-IPO / recently-listed
+        filers (see caller). A present quarter Q whose *immediately preceding*
+        quarter (Q-1, same fiscal year) is ABSENT is a cumulative running from the
+        gap start through Q — never de-cumulated. (Quarters that follow a present
+        quarter ARE de-cumulated by FinMind, so they're discrete and untouched.)
+
+          - REVENUE: recover the true discrete quarter from the discrete monthly
+            dataset, but ONLY when the monthly sum over the cumulative's span
+            reconciles to the FS value (confirming parent≈consolidated). If it
+            doesn't reconcile (consolidated≠parent), DROP the quarter rather than
+            emit a wrong number. Missing earlier quarters in the span are filled
+            from monthly too (a bonus).
+          - Other FLOW metrics have no monthly proxy, so the cumulative can't be
+            de-cumulated — DROP the quarter (emit nothing, never a wrong value)."""
+        by_year = {}
+        for (y, q), v in out.items():
+            by_year.setdefault(y, {})[q] = v
+        # (year, quarter, span_start_quarter) for each contaminated cell
+        bad = []
+        for y, qm in by_year.items():
+            present = sorted(qm)
+            for q in present:
+                if q > 1 and (q - 1) not in qm:
+                    prev = max([p for p in present if p < q], default=0)
+                    bad.append((y, q, prev + 1))
+        if not bad:
+            return out
+        if metric != "REVENUE":
+            for (y, q, _s) in bad:
+                out.pop((y, q), None)
+            return out
+        mrev = self._month_revenue(sid)
+        for (y, q, span_start) in bad:
+            fs_val = out.get((y, q))
+            span_q = range(span_start, q + 1)
+            span_months = [m for qq in span_q for m in self._q_months(qq)]
+            have_all = all((y, m) in mrev for m in span_months)
+            span_sum = sum(mrev.get((y, m), 0.0) for m in span_months)
+            if have_all and fs_val and \
+                    abs(span_sum - fs_val) <= 0.005 * abs(fs_val):
+                # reconciles -> monthly discrete is trustworthy; substitute the
+                # true discrete quarter, filling any missing earlier quarter too.
+                for qq in span_q:
+                    out[(y, qq)] = sum(mrev.get((y, m), 0.0)
+                                       for m in self._q_months(qq))
+            else:
+                out.pop((y, q), None)
+        return out
 
 
 # ---- China A-shares: Eastmoney F10 (the data AKShare wraps) ---------------- #
