@@ -85,6 +85,14 @@ tolerances (1% money, ±0.02 EPS). Rows with no reference counterpart →
 `MISSING_IN_REFERENCE`. (`--dump` alone does statements only; add `--dump-seg` for
 segment/geo. China segment/geo is excluded — semi-annual only.)
 
+`--dump` writes **every distinct filing vintage** of a restated period (see below),
+one row per vintage, and `--reference` matches your file against **any** of them —
+so the offline path handles as-filed-vs-restated exactly like the live path, with
+the same `api_vintages` / `vintage_match` columns. **Re-run `--dump` after upgrading**
+if your existing `reference/` was pulled by an older version that stored a single
+(for US, restated) value per period — otherwise the offline path can't see the
+as-originally-filed figure.
+
 Outputs:
 - `out/verification_results.csv` — every row with a status.
 - `out/mismatches.csv` — only the rows that disagree.
@@ -158,7 +166,12 @@ counts a `MATCH` if your file agrees with **any** of them — so a file holding 
 as-originally-filed number isn't flagged as a `MISMATCH` just because EDGAR's
 latest frame is the restated one (or vice versa). The `note` column lists all the
 vintages and says which one your value matched (or "matches none" on a genuine
-`MISMATCH`), and `api_value_local` shows the vintage that matched.
+`MISMATCH`); `api_value_local` / `api_value_millions` show the vintage that
+matched, `api_vintages` lists them all, and `vintage_match` is `latest` /
+`superseded` / `none`. This holds on **both** paths — the live API run and the
+offline `--dump`/`--reference` run (the dump writes one row per vintage). It also
+covers Korea (DART) and Japan (EDINET) restatements recovered from the following
+year's comparative columns, not just US EDGAR.
 
 Example — **Dell CY2021Q3 COGS** (VMware spun off Nov 1 2021): `$20,335M` as
 originally filed (incl. VMware) and `$20,890M` as later restated to continuing

@@ -3583,15 +3583,31 @@ def dump_reference(out_dir: Path, registry: dict, years, include_seg: bool = Fal
                 print(f"     ! {metric}: {str(e)[:60]}", flush=True); continue
             ps = CANONICAL[metric]["per_share"]
             sign = -1 if metric in SIGN_FLIP_METRICS else 1   # negative-CAPEX convention
+            # Restatement vintages: dump the primary (quarterly()) value AND every
+            # distinct restated value frames() recovers for the same period, so the
+            # offline --reference path can match a file holding the as-originally-filed
+            # figure — otherwise the reference collapses each period to a single
+            # (for US, restated) value and the as-filed number falsely MISMATCHes.
+            try:
+                extra = src.frames(comp["api_id"], metric, comp["fye_month"],
+                                   years=yset)
+            except Exception:
+                extra = {}
             for (y, q), v in sorted(series.items()):
                 if y not in yset:
                     continue
-                v *= sign
-                faw.writerow({"company_id": cid, "fiscal_year": "",
-                              "fiscal_quarter": "", "calendar_year": y,
-                              "calendar_quarter": q, "financial_code": metric,
-                              "financial_value": "",
-                              "financial_report_value": round(v if ps else v / 1e6, 4)})
+                seen = set()                       # primary first, then distinct extras
+                for cand in [v] + list(extra.get((y, q), [])):
+                    val = cand * sign
+                    out = round(val if ps else val / 1e6, 4)
+                    if out in seen:
+                        continue
+                    seen.add(out)
+                    faw.writerow({"company_id": cid, "fiscal_year": "",
+                                  "fiscal_quarter": "", "calendar_year": y,
+                                  "calendar_quarter": q, "financial_code": metric,
+                                  "financial_value": "",
+                                  "financial_report_value": out})
         fa.flush()
     fa.close()
     print(f"\nStatements reference -> {ref/'FA.csv'}", flush=True)
@@ -4068,14 +4084,20 @@ def compare_against_reference(data_dir: Path, ref_dir: Path, out_dir: Path,
                     return list(csv.DictReader(f, delimiter=";"))
         return []
 
-    ref_fa = {}                                   # (cid, cy, cq, canonical) -> value
+    # (cid, cy, cq, canonical) -> [distinct vintages], primary (as-dumped) first. A
+    # period restated after its original filing carries >1 value; matching against
+    # ANY of them keeps a file holding the as-originally-filed figure from falsely
+    # mismatching the reference's (for US, restated) primary.
+    ref_fa = defaultdict(list)
     for r in _read("FA.csv"):
         try:
-            ref_fa[(r["company_id"].strip(), r["calendar_year"].strip(),
-                    r["calendar_quarter"].strip(), r["financial_code"].strip())] = \
-                float(r["financial_report_value"])
+            val = float(r["financial_report_value"])
         except (ValueError, KeyError, TypeError):
-            pass
+            continue
+        key = (r["company_id"].strip(), r["calendar_year"].strip(),
+               r["calendar_quarter"].strip(), r["financial_code"].strip())
+        if all(round(val, 4) != round(x, 4) for x in ref_fa[key]):
+            ref_fa[key].append(val)
     ref_seg = {"Seg_Geo_Revenue": defaultdict(list),
                "Seg_Seg_Revenue": defaultdict(list)}
     for logical in ref_seg:
@@ -4096,6 +4118,12 @@ def compare_against_reference(data_dir: Path, ref_dir: Path, out_dir: Path,
             return "MATCH" if abs(fv - ref) < NEAR_ZERO else "MISMATCH"
         return ("MATCH" if abs(fv - ref) / max(abs(fv), abs(ref)) <= REL_TOL
                 else "MISMATCH")
+
+    # Which dumped vintage is the most-recently-filed one, for the latest/superseded
+    # label — same convention as the live path (Source.primary_is_latest): EDGAR's
+    # primary is the latest restatement, DART/EDINET's primary is the as-filed value.
+    # TW/CN sources expose a single vintage, so the flag is moot for them.
+    pil_by_market = {"us": True, "kr": False, "jp": False}
 
     results = []
     for logical, fname in files_map.items():
@@ -4119,6 +4147,7 @@ def compare_against_reference(data_dir: Path, ref_dir: Path, out_dir: Path,
                        "segment_code": (row.get("segment_code") or "").strip(),
                        "file_value": row.get("financial_report_value", ""),
                        "api_value_local": "", "api_value_millions": "",
+                       "api_vintages": "", "vintage_match": "",
                        "status": "", "note": ""}
                 try:
                     fv = float(str(rec["file_value"]).replace(",", ""))
@@ -4151,21 +4180,51 @@ def compare_against_reference(data_dir: Path, ref_dir: Path, out_dir: Path,
                     rec["status"] = "UNSUPPORTED_DERIVED"; results.append(rec); continue
                 if not canonical:
                     rec["status"] = "NO_MAPPING"; results.append(rec); continue
-                ref_val = ref_fa.get((cid, cy, cq, canonical))
-                if ref_val is None:
+                ref_vals = ref_fa.get((cid, cy, cq, canonical))
+                if not ref_vals:
                     rec["status"] = "MISSING_IN_REFERENCE"
                     rec["note"] = f"{canonical} not in reference for this period"
                     results.append(rec); continue
                 per_share = CANONICAL.get(canonical, {}).get("per_share", False)
-                rec["api_value_millions"] = "" if per_share else round(ref_val, 3)
-                rec["api_value_local"] = ref_val if per_share else ""
-                rec["status"] = cmp(fv, ref_val, per_share)
-                rec["note"] = f"matched {canonical}"
+                # Reference values are stored in millions (per-share direct); the shared
+                # vintage helpers expect full local currency, so scale money back up and
+                # reuse compare_multi/vintage_columns exactly as the live path does —
+                # match against ANY vintage, and display the one that matched.
+                scale = 1.0 if per_share else 1e6
+                cand = [v * scale for v in ref_vals]           # primary first
+                primary = cand[0]
+                status, matched_local, api_m, matched = compare_multi(
+                    fv, cand, per_share)
+                pil = pil_by_market.get(registry.get(cid, {}).get("market"), True)
+                rec["api_value_local"] = matched_local if per_share else ""
+                rec["api_value_millions"] = "" if per_share else round(api_m, 3)
+                rec["status"] = status
+                rec["api_vintages"], rec["vintage_match"] = vintage_columns(
+                    cand, primary, matched_local, matched, per_share, pil)
+                if len(cand) > 1:
+                    latest = latest_vintage(cand, primary, pil)
+                    unit = "" if per_share else " (millions)"
+                    vlist = " / ".join(_vfmt(c, per_share) for c in cand)
+                    if matched and round(matched_local, 2) != round(latest, 2):
+                        rec["note"] = (
+                            f"matches a superseded filing vintage "
+                            f"{_vfmt(matched_local, per_share)}; latest filed value "
+                            f"is {_vfmt(latest, per_share)}{unit} "
+                            f"(all vintages: {vlist})")
+                    else:
+                        rec["note"] = (
+                            f"{len(cand)} filed vintages for this period "
+                            f"(as-filed vs restated): {vlist}{unit}"
+                            + (f"; file matches the latest "
+                               f"{_vfmt(matched_local, per_share)}"
+                               if matched else "; file matches none"))
+                else:
+                    rec["note"] = f"matched {canonical}"
                 results.append(rec)
 
     cols = ["file", "company_id", "company_name", "calendar_year", "calendar_quarter",
             "financial_code", "segment_code", "file_value", "api_value_local",
-            "api_value_millions", "status", "note"]
+            "api_value_millions", "api_vintages", "vintage_match", "status", "note"]
     with open(out_dir / "verification_results.csv", "w", newline="",
               encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols); w.writeheader()
