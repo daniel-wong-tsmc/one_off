@@ -4477,8 +4477,10 @@ def main():
     ap.add_argument("--dump-seg", action="store_true",
                     help="with --dump, also enumerate segment/geographic revenue "
                          "(US/TW fully, KR geographic; slower)")
-    ap.add_argument("--dump-years", default="2019-2025",
-                    help="year range for --dump, e.g. 2019-2025 or 2022-2025")
+    ap.add_argument("--dump-years", default="2019-2026",
+                    help="year range for --dump, e.g. 2019-2026 or 2022-2026. Extend "
+                         "the upper bound as new years are filed so the reference "
+                         "keeps covering the latest quarters.")
     ap.add_argument("--reference", default=None,
                     help="compare your --data-dir files against a pulled reference "
                          "dir (offline, no API calls) with fuzzy label matching, "

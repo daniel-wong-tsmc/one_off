@@ -110,7 +110,7 @@ fast) with fuzzy label matching:
 
 ```bash
 # 1. Pull the reference (slow — Japan EDINET + Taiwan PDFs; caches as it goes):
-python verify_earnings.py --dump --dump-seg --dump-years 2019-2025 --out-dir ./out
+python verify_earnings.py --dump --dump-seg --dump-years 2019-2026 --out-dir ./out
 #    -> ./out/reference/FA.csv, Seg_Geo_Revenue.csv, Seg_Seg_Revenue.csv (your schema)
 
 # 2. Fuzzy-match your files against it (no API calls):
