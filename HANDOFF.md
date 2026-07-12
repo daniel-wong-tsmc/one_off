@@ -12,7 +12,8 @@ does not match**. (China was explicitly dropped from scope.)
 - Main program: `verify_earnings.py` (single file, stdlib + `requests`).
 - Background research: `earnings-api-research.md`.
 - User guide + assumptions + limitations: `README.md` (read this too).
-- Branch: `claude/earnings-api-research-kwe3km-gp1m3p`. All work is committed & pushed.
+- Branch: `claude/earnings-reconciliation-setup-qpq0bq`, ff-merged to `main` as work lands.
+  All work is committed & pushed. (Earlier work was on `claude/earnings-api-research-kwe3km-gp1m3p`.)
 
 ## Run it
 
@@ -216,6 +217,87 @@ and JP 販管費 both **include** R&D, so it must be subtracted.
   `SGA_EXPENSE` reports a value only where it can be correctly R&D-excluded, else
   MISSING. In practice most/all JP quarters report no value. (JP SGA has no J-Quants
   fallback, so this fully governs JP SGA.) No confirmed JP target yet — best-effort.
+
+## Restatement / vintage reconciliation (multi-source) — this session
+
+Companies **restate/recast** prior periods often (spin-offs, discontinued-ops
+reclass, prior-period error corrections). The user's file usually holds the
+**as-originally-filed** number; an API that returns only the latest figure then
+falsely MISMATCHes. The tool now gathers **every as-filed vintage** it can and
+MATCHes the file against ANY of them.
+
+**Mechanism.** Each `Source` may expose
+`frames(api_id, metric, fye_month, years) -> {(cal_y,cal_q): [distinct vintage
+values, full local currency]}`. In `run()`: `primary = quarterly()` value, then
+`cand = [primary] + frames()` distinct values, then `compare_multi(fv, cand,
+per_share)` → MATCH if the file matches any candidate. Base `Source.frames()`
+returns `{}` (single value). **Sign flip:** `SIGN_FLIP_METRICS = {"CAPEX"}` — the
+user's files carry CAPEX negative (cash outflow); the API value is negated in
+`get_series`/`get_frames` and the reference dump so signs line up.
+
+**Per-source `frames()` coverage:**
+- **US / `EdgarSource`** — companyconcept returns every filing's fact, so all
+  vintages of ~90-day discrete quarters and instant balances are captured; PLUS
+  the **derived Q4** (`FY_vintage − 9M_vintage`, cross-product of the distinct FY
+  and 9M frames per fiscal year, immaterial re-rounding within 0.1% collapsed).
+  YTD-ladder rungs Q1–Q3 left to `quarterly()`. Dict-spec metrics (OPERATING_EXPENSE,
+  SG&A) return `{}`.
+- **KR / `OpenDartSource`** — reads year Y+1's reports' **전기 (prior-year)
+  comparative** columns (`frmtrm_q_amount`/`frmtrm_amount`/`frmtrm_add_amount`)
+  and de-cumulates them with the same `_flow_discrete`/`_to_discrete` machinery
+  as `quarterly()`. Stock = prior year-end balance as (Y,4). `SGA_EXPENSE` → `{}`
+  (its R&D-adjusted primary has no clean frmtrm comparable). Validated 32/32 exact
+  reproductions on unrestated DB HiTek/Hyundai; surfaced real restatements
+  (DB HiTek 2023 revenue gross↔net reclass 298,167→275,578; FY2022 net income/assets).
+- **JP / `EdinetSource`** — reads the `Prior1YearDuration`/`Prior1YTDDuration`
+  comparative XBRL contexts and de-cumulates. Flow only (interim balance-sheet
+  comparative is prior YEAR-END, not the prior same-quarter). **Wired through
+  `JapanSource.frames()`** which delegates to EDINET — the `'jp'` source is the
+  composite, NOT `EdinetSource`, so without this the EDINET frames were dead code.
+- **TW / CN** — no `frames()` yet (single value).
+
+**`primary_is_latest` (class attribute) — WHICH vintage is newest is
+source-dependent.** EDGAR's `quarterly()` returns the *latest* fact (`True`);
+DART/EDINET/Japan read a period from its *own* report (as-originally-filed) and
+`frames()` supplies the *newer* restatement (`False`). `latest_vintage()` and
+`vintage_columns()` use this so "latest"/"superseded" isn't inverted for KR/JP.
+(Both the direction bug and the dead-EDINET-frames bug were caught by an
+end-to-end test, not the self-test — see below.)
+
+**Output columns** (`verification_results.csv` / `mismatches.csv`):
+- `api_vintages` — every candidate value (millions for money, raw per-share),
+  e.g. `1445.000 / 1392.000`.
+- `vintage_match` — `latest` (matched the most-recently-filed value),
+  `superseded` (matched an older value since restated), `none` (MISMATCH), or `""`.
+- On a superseded MATCH the note reads e.g. *"matches a superseded filing vintage
+  1392.000; latest filed value is 1445.000 (millions)"*. Status stays MATCH.
+- `mismatch_code_summary.csv` + console: per-`financial_code` mismatch **count**
+  and **average % difference** `mean((file−api)/api·100)` (unparseable/zero-api
+  rows counted but excluded from the average).
+
+**KR flow de-cumulation fix (important correctness bug).** `quarterly()` used to
+guess 3-month-vs-cumulative from the Q3/annual ratio (>0.5 ⇒ cumulative). Back-loaded
+filers broke it: LX Semicon 2020 net income Q3 3-month (36,959) is 51% of the year,
+misread as a 9-month cumulative → Q4 = 35,570 (and a negative Q2) instead of the true
+**16,014**. Now `_flow_discrete(vals, cum)` de-cumulates deterministically from DART's
+YTD column (`thstrm_add_amount`) when present; `_val` also matches the `(손실)` loss
+suffix and 분기/반기순이익 interim names it previously missed. DB HiTek/Hyundai unchanged;
+LX Semicon corrected across net income / operating income / tax / SGA.
+
+**Testing note for the next instance.** The self-test is mostly single-vintage, so it
+did NOT catch the two vintage bugs above. A **targeted end-to-end test** did —
+`scratchpad/testdata/FA.csv` with the user's real discrepancy cells (Dell/SLAB
+restatements, Nissan, LX Semicon, DB HiTek restatement, CAPEX) run through
+`--data-dir`. Rebuild that kind of fixture when touching the vintage path; assert the
+actual `status`/`vintage_match`/`api_vintages`/`note` columns, not just MATCH counts.
+
+**Known limits / follow-ups (vintages):** KR/JP comparatives expose only the
+immediately-preceding year → only the *latest* restatement recoverable (US/EDGAR gets
+the full chain); US Q4 candidates are an FY×9M cross-product (slightly lenient, but all
+shown in `api_vintages`); interim (Q1–Q3) balance-sheet restatements not recoverable for
+KR/JP; TW/CN have no vintage source; a minimal single-year data slice can leave JP
+quarters MISSING (de-cumulation needs the adjacent quarter — resolves with real
+multi-year data).
 
 ## Not done / next steps (roughly by value)
 
