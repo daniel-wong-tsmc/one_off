@@ -2579,6 +2579,7 @@ class EdinetSource(Source):
         "TOTAL_LIABILITIES": ["jppfs_cor:Liabilities", "jpigp_cor:LiabilitiesIFRS"],
         "TOTAL_EQUITY": ["jppfs_cor:NetAssets", "jpigp_cor:EquityIFRS"],
         "ACCOUNTS_RECEIVABLE": ["jppfs_cor:NotesAndAccountsReceivableTrade",
+                                "jppfs_cor:NotesAndAccountsReceivableTradeAndContractAssets",
                                 "jpigp_cor:TradeAndOtherReceivablesCAIFRS",
                                 "jpigp_cor:TradeReceivablesCAIFRS"],
         "CASH_AND_CASH_EQUIVALENTS": ["jppfs_cor:CashAndDeposits",
@@ -2721,6 +2722,62 @@ class EdinetSource(Source):
                     return None
         return None
 
+    @staticmethod
+    def _is_current_finance_receivable(ln):
+        """True if XBRL element local-name `ln` is a captive finance subsidiary's
+        CURRENT financing/sales-finance receivable line — the JP analogue of the US
+        finance-receivable component summed via US_FINANCE_RECEIVABLE, but matched by
+        NAME PATTERN rather than a hardcoded company list, so any JP filer with a
+        finance arm (Honda ReceivablesFromFinancialServices…, Toyota ReceivablesRelated
+        ToFinancialServices…, Nissan SalesFinanceReceivable…, or one added later) is
+        picked up automatically. CURRENT portion only — the non-current tail is the
+        long-dated financing book and is excluded, matching the user's convention."""
+        # never fold trade / notes / other receivables into the finance component:
+        # those are the trade A/R base (already read) or a separate definition point
+        # (e.g. AGC's OtherReceivables), so the finance pattern must skip them.
+        if "Trade" in ln or "Notes" in ln or "Other" in ln:
+            return False
+        finance = (("FinancialServices" in ln and "Receivable" in ln)
+                   or "SalesFinanceReceivable" in ln
+                   or "FinanceReceivable" in ln)   # FinanceReceivable(s)
+        if not finance:
+            return False
+        # current vs non-current: IFRS current suffix is …CAIFRS (non-current …NCAIFRS,
+        # which also ends CAIFRS so must be excluded explicitly); JGAAP current ends
+        # …CA (non-current …NCA). Anything flagged NonCurrent/…NCA is the long-dated
+        # tail; anything whose current/non-current split can't be read from the suffix
+        # is left out (under-include over double-count, per the no-wrong-value rule).
+        if "NonCurrent" in ln or ln.endswith("NCAIFRS") or ln.endswith("NCA"):
+            return False
+        return ln.endswith("CAIFRS") or ln.endswith("CA")
+
+    def _finance_receivable_current(self, doc, is_annual):
+        """Sum of the captive finance subsidiary's CURRENT financing-receivable
+        line(s) at this report's balance-sheet instant context (CurrentYearInstant /
+        CurrentQuarterInstant — the same context _report_value reads the trade A/R
+        element at). Returns 0.0 when the filer has no such line (the 11 non-finance JP
+        filers), so ACCOUNTS_RECEIVABLE stays trade-only for them. Matched by
+        _is_current_finance_receivable; if a filer legitimately tags several current
+        finance-receivable lines they are summed (each element once). This is the JP,
+        pattern-driven counterpart to US_FINANCE_RECEIVABLE."""
+        text = self._csv_text(doc)
+        rows = list(csv.reader(io.StringIO(text), delimiter="\t"))
+        hdr = rows[0]
+        eid, ctxi, vali = hdr.index("要素ID"), hdr.index("コンテキストID"), hdr.index("値")
+        ctx = "CurrentYearInstant" if is_annual else "CurrentQuarterInstant"
+        seen = {}
+        for r in rows[1:]:
+            if len(r) <= vali or r[ctxi] != ctx:   # exact ctx: consolidated, undimensioned
+                continue
+            ln = r[eid].split(":")[-1]
+            if r[eid] in seen or not self._is_current_finance_receivable(ln):
+                continue
+            try:
+                seen[r[eid]] = float(r[vali])
+            except ValueError:
+                continue
+        return sum(seen.values())
+
     def _prior_report_value(self, doc, metric, is_annual):
         """Value of `metric` at the report's PRIOR-year comparative context —
         Prior1YearDuration (annual) / Prior1YTDDuration (quarterly YTD) for flows.
@@ -2846,6 +2903,15 @@ class EdinetSource(Source):
             for pe_iso, (doc, is_annual) in docs.items():
                 v = self._report_value(doc, metric, is_annual)
                 if v is not None:
+                    # Captive-finance JP filers (automakers): ACCOUNTS_RECEIVABLE =
+                    # trade receivables + the finance subsidiary's CURRENT financing
+                    # receivable (non-current excluded), per the user's convention —
+                    # the JP analogue of US_FINANCE_RECEIVABLE, but pattern-driven
+                    # (see _is_current_finance_receivable) so no company list is
+                    # maintained. 0.0 for the non-finance filers, leaving them
+                    # trade-only.
+                    if metric == "ACCOUNTS_RECEIVABLE":
+                        v += self._finance_receivable_current(doc, is_annual)
                     out[cal_key_from_date(pe_iso)] = v
             return out
         # flow (income statement): period-end -> YTD, de-cumulated below
