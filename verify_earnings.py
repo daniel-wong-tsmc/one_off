@@ -553,6 +553,40 @@ class EdgarSource(Source):
         tags = spec if isinstance(spec, list) else [spec]
         return self._series_from_facts(self._facts_for(cik, tags, unit), kind)
 
+    def _combined_da_is_depreciation_only(self, cik):
+        """True when this filer's preferred combined-D&A tag is actually
+        DEPRECIATION-ONLY — i.e. it (≈) equals the standalone `Depreciation` tag
+        while a SEPARATE intangible-amortization tag carries a material value, so
+        the prefer branch would return depreciation alone and silently drop the
+        amortization (MBLY; FLEX in its older filings). Data-driven, no company
+        list: compared at the latest fiscal year-end the combined and Depreciation
+        series share, using annual frames (single filed numbers, far less noisy
+        than de-cumulated quarters). Genuine combined-tag filers, whose combined
+        value clearly EXCEEDS Depreciation because it already folds amortization
+        in, fail the ~2% closeness test and are left untouched."""
+        spec = self.metric_map["DEPRECIATION_AND_AMORTIZATION"]
+        comb = {}
+        for tag in spec["prefer"]:
+            comb = self._annual_by_end(self._concept(cik, tag))
+            if comb:
+                break
+        dep = self._annual_by_end(self._concept(cik, "Depreciation"))
+        common = sorted(set(comb) & set(dep))
+        if not common:
+            return False
+        ye = common[-1]
+        c, d = comb[ye], dep[ye]
+        if not c or abs(c - d) > 0.02 * abs(c):     # combined must ≈ depreciation-only
+            return False
+        amort = {}
+        for tag in ("AmortizationOfIntangibleAssets",
+                    "FiniteLivedIntangibleAssetsAmortizationExpense"):
+            amort = self._annual_by_end(self._concept(cik, tag))
+            if amort:
+                break
+        a = amort.get(ye, 0.0)                       # separate amortization at the SAME FY end
+        return abs(a) >= 0.05 * abs(c)               # ... and material
+
     def quarterly(self, api_id, metric, fye_month=12, years=None):
         cik = self._resolve_cik(api_id)
         if not cik:
@@ -562,6 +596,20 @@ class EdgarSource(Source):
         spec = (self._revenue_tag_order(cik) if metric == "REVENUE"
                 else self.metric_map[metric])
         series = self._resolve(cik, spec, kind, unit)
+        # D&A where the preferred "combined" tag is really DEPRECIATION-ONLY: some
+        # filers tag DepreciationDepletionAndAmortization identically to the
+        # standalone `Depreciation` line and report the large acquired-intangible
+        # amortization SEPARATELY (MBLY; FLEX pre-2020), so the prefer branch above
+        # returns depreciation alone and DROPS the amortization. When that data
+        # pattern is present, fall through to the else-sum branch (Depreciation +
+        # intangible amortization), which captures both components. Driven by the
+        # data (see _combined_da_is_depreciation_only), so future filers are covered
+        # automatically; genuine combined-tag filers and the US_CUSTOM_DA filers
+        # (SLAB, CSCO — handled below) are left unchanged.
+        if (metric == "DEPRECIATION_AND_AMORTIZATION" and cik not in US_CUSTOM_DA
+                and isinstance(spec, dict) and "prefer" in spec
+                and self._combined_da_is_depreciation_only(cik)):
+            series = self._resolve(cik, spec["else"], kind, unit)
         # Finance-arm filers (GM, Ford): ACCOUNTS_RECEIVABLE = trade receivables +
         # the captive-finance subsidiary's current receivables (from the instance).
         if metric == "ACCOUNTS_RECEIVABLE" and cik in US_FINANCE_RECEIVABLE:
