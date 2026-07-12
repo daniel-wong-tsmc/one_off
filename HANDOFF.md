@@ -150,6 +150,30 @@ Services)**. Every other US filer is untouched (trade only). **Verified:** GM 20
 11,721 + 6,427 = **18,148**; Cisco = 4,827 + 3,085 = **7,912**; HPE latest = 6,286 +
 3,694 = **9,980** (US$M) — all matching the as-filed balance sheets.
 
+**JP analogue — pattern-driven (no company list).** The same convention (trade +
+CURRENT finance-services receivable, non-current excluded) applies to captive-finance
+JP filers, but here it's detected by XBRL **element-name pattern**, not a fixed map, so
+any JP filer with a finance arm (now or added later) is covered automatically.
+`EdinetSource._is_current_finance_receivable(ln)` matches a current finance line —
+`FinancialServices`+`Receivable`, `SalesFinanceReceivable`, or `FinanceReceivable`,
+requiring current (IFRS `…CAIFRS` / JGAAP `…CA`) and excluding non-current
+(`…NCAIFRS`/`…NCA`/`NonCurrent`) and any Trade/Notes/Other line;
+`_finance_receivable_current(doc, is_annual)` sums the matches at the balance-sheet
+instant context, and `quarterly()` adds it onto the trade A/R for ACCOUNTS_RECEIVABLE.
+The 3 affected filers each use a DIFFERENT tag — Honda `ReceivablesFromFinancialServices
+…CAIFRS`, Toyota `ReceivablesRelatedToFinancialServices…CAIFRS`, Nissan (JGAAP)
+`SalesFinanceReceivableCA` — all caught by the one pattern; the other 11 JP filers have
+no such line → 0.0 added (trade-only, unchanged). **Verified:** Honda 2022Q3 912,679 +
+1,881,825 = **2,794,504** (matches the user's file; non-current 4,038,736 excluded);
+Toyota 2022Q3 = **11,396,303**; Nissan 2022Q3 = **7,117,758** (¥M). Note: Nissan's trade
+base needed `jppfs_cor:NotesAndAccountsReceivableTradeAndContractAssets` added to the
+`ACCOUNTS_RECEIVABLE` metric_map (side benefit: MGC / Tokyo Seimitsu now emit correct
+trade-only A/R where they previously emitted nothing). **Known limitation:** a
+pre-existing `EdinetSource._report_value` quirk — it returns `None` when the FIRST
+candidate tag is present but nil (`'－'`) instead of falling through to the next — drops
+Nissan's/MGC's March (annual) A/R periods to MISSING (never a wrong value); fixing it
+means touching the shared `_report_value` (all metrics), left as a follow-up.
+
 ### US DEPRECIATION_AND_AMORTIZATION = depreciation + amortization
 Total D&A (the cash-flow add-back). The spec now PREFERS a combined
 depreciation-and-amortization tag, ELSE **sums** `Depreciation` +
@@ -431,6 +455,12 @@ multi-year data).
     and already shows off-by-one rounding (LX Semicon Q3 2,273 vs the filed 3-month
     2,272). EPS should be read from the reported 3-month column directly, not
     de-cumulated. (Surfaced by the spot-check; not yet fixed.)
+11. **`EdinetSource._report_value` doesn't fall through a nil first candidate.** When
+    the first metric_map tag is PRESENT but nil (`'－'`), it returns `None` instead of
+    trying the next candidate — dropping e.g. Nissan's/MGC's March (annual)
+    ACCOUNTS_RECEIVABLE to MISSING. Making it skip nil facts and continue would recover
+    those periods (and likely others across metrics), but it touches the shared reader
+    used by every JP metric, so validate broadly before changing.
 
 ## Gotchas / lessons
 
