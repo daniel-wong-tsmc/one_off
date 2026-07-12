@@ -164,6 +164,17 @@ us-gaap alone returned nothing). **Verified:** SWKS 24Q3 68.5+46.9=**115.4**; SL
 25Q3 6.068+2.294=**8.362**; QRVO 26Q1 35.9+26.9=**62.7**; Cisco 25Q3 = **606** (was
 empty). Combined-tag filers (~17) are unchanged.
 
+**Update (spot-check fix):** some filers tag a combined D&A element that is actually
+DEPRECIATION-ONLY (identical to their `Depreciation` line) while reporting large
+acquired-intangible amortization SEPARATELY under `AmortizationOfIntangibleAssets` —
+so the `prefer` branch returned depreciation alone and DROPPED the amortization
+(**Mobileye** 2023Q4 15→**127**, dropping ~$474M/yr; **Flex** pre-2020, ~$75M/yr).
+`EdgarSource._combined_da_is_depreciation_only(cik)` now detects this data pattern
+(combined ≈ `Depreciation` within 2% AND a material separate amortization tag ≥5%,
+compared on annual frames) and falls through to the else-sum branch. Data-driven, no
+company list; genuine combined-tag filers (combined clearly exceeds depreciation, e.g.
+JBL) and `US_CUSTOM_DA` filers (SLAB/Cisco) are untouched.
+
 ### US OPERATING_EXPENSE = opex excluding COGS (accounting identity)
 `OPERATING_EXPENSE` is opex-ex-COGS = every operating-expense line between gross
 profit and operating income. The reported `OperatingExpenses` tag is trusted only
@@ -181,11 +192,23 @@ or (for the SG&A+R&D fallback) when it would fall *below* that lower bound. Genu
 GM 26Q1 = **5,670** (SG&A 2,069 + GM Financial opex 3,601); STX 25Q3 = **343** (SG&A
 144 + R&D 186 + restructuring 13); ON Semi 24Q3 stays 354. Broad effect: ~175 US
 opex rows now reflect full opex (JBL 291→446, NDSN, FLEX, …) instead of the SG&A+R&D
-undercount. **Known limitation:** GM's *derived* Q4 (annual − 9-month) still shows
-total-costs — de-cumulating GM's segment-level annual COGS is a follow-up; only the
-directly-filed quarters (incl. the flagged 2026Q1) are corrected. A couple of DELL
-Q4 `OperatingExpenses` values are negative in the source (pre-existing derived-Q4
-artifact in DELL's own tag) and are left as-is.
+undercount. A couple of DELL Q4 `OperatingExpenses` values are negative in the source
+(pre-existing derived-Q4 artifact in DELL's own tag) and are left as-is.
+
+**Update (spot-check fix): the `Rev−COGS−OI` identity is INVALID for captive-finance
+filers.** Their COGS tag excludes the finance arm's cost of financing while Revenue
+includes finance revenue, so the residual wrongly absorbs the finance-arm's
+interest/operating/other expenses (Ford 2021Q4 = 4,546 = SG&A 3,248 + Ford Credit
+1,298). `quarterly()` now splits OPERATING_EXPENSE: **captive-finance filers (keyed on
+the `US_FINANCE_RECEIVABLE` CIK set) never use the identity** — they keep a genuine
+`OperatingExpenses` tag if it sits far from `Revenue−OperatingIncome` (Dell, Cisco —
+unchanged), else use the SG&A(+R&D) `else`-spec (Ford 2021Q4→**3,248**, GM 2025Q4→
+**2,526**, HPE 2021Q4→**1,705**). Non-finance filers keep the identity verbatim (ON
+354, STX 343 unchanged). This also **resolves the old GM total-costs Q4 limitation**.
+**Residual:** GM stopped tagging face-level SG&A ~2018, so recent GM opex is read from
+the segment-summed `SellingGeneralAndAdministrativeExpense` in the filing instance
+(GM has no separate R&D line) — correct and far better than the finance-inflated
+figure, but instance-dependent rather than a clean face-statement companyconcept line.
 
 ### SG&A excluding R&D — the user's convention (KR done, JP no-value)
 The user's SG&A **excludes** R&D (US ON Semi SGA = S&M + G&A, no R&D). KR 판매비와관리비
@@ -198,7 +221,21 @@ and JP 販管費 both **include** R&D, so it must be subtracted.
   with the *same* `_to_discrete` machinery as the SGA total, and `quarterly()`
   subtracts. Filers with R&D in COGS have no SG&A R&D row → nothing subtracted (SGA
   unchanged). **Verified:** Hyundai (005380) 2025Q3 판관비 5,746,793 − R&D 640,577 =
-  **5,106,216** (₩M). Note: the SG&A R&D label was renamed 연구비→경상개발비 between the
+  **5,106,216** (₩M).
+  **Update (spot-check fix): note recognition no longer requires a literal
+  `판매비와관리비` body cell.** Some filers' functional SG&A note captions it
+  `판매비와관리비` but labels the grand-total row `계` (Hyundai's 2020–2023 filings), so
+  the old body-cell gate missed it and R&D was never subtracted (SG&A overstated:
+  Hyundai 2022Q3 5,805,372→**5,372,276**, R&D 433,096). `_sga_note_rd` now ALSO accepts
+  a table when `판매비와관리비` is in the ~800-char caption before it AND the grand-total
+  row is labeled `계` or `판매비와관리비` (급여-component guard + R&D-row matcher preserved;
+  total restricted to `계`/`판매비와관리비`, NOT `합계`, to avoid mis-scaling / inconsistent
+  annual-only notes). Hyundai 2025Q3 (body-cell path) still 5,106,216; LX/DB HiTek/
+  ADTech unchanged. **Residual — DB HiTek (000990):** carries R&D in 판관비 (~46%) but is
+  deliberately NOT recognized — its total row is `합 계`, its `단위: 백만원` hint sits
+  INSIDE the table (the unit-reader would mis-scale ×1e6), and its note is missing in
+  some quarters (would trip the consistency-drop rule). So DB HiTek SG&A stays
+  R&D-inclusive; fully fixing it needs an in-table 단위 read + missing-quarter back-fill. Note: the SG&A R&D label was renamed 연구비→경상개발비 between the
   2024 and 2025 filings — matched on 연구/개발 within the validated note, not a fixed label.
   Consistency rule: once a year is known to carry R&D in SG&A, every quarter must be
   R&D-excluded; a quarter whose R&D can't be recovered is DROPPED (no value) rather than
@@ -380,6 +417,20 @@ multi-year data).
    report fetches. Consider a prebuilt EDINET doc index if the JP universe is
    large. (Cold-cache runs can transiently miss a JP report; a warm-cache re-run
    fixes it.)
+8. **DB HiTek (000990) SG&A still R&D-inclusive** — see the SG&A residual above.
+   Needs (i) reading the `단위` hint from INSIDE the note table and (ii) back-filling
+   quarters where the functional note is absent, before its `합 계`-labelled note can
+   be safely recognised.
+9. **GM operating expense is instance-dependent** — GM stopped tagging face-level
+   SG&A ~2018, so recent GM opex comes from the segment-summed instance read (see
+   the OPERATING_EXPENSE residual above). Works, but a clean face-statement source
+   would be more robust.
+10. **KR EPS is de-cumulated (latent).** EPS is routed through the flow
+    de-cumulation, i.e. per-share values are DIFFERENCED (Q4 = FY − 9M). This is
+    conceptually invalid — it only coincides with truth when share count is constant,
+    and already shows off-by-one rounding (LX Semicon Q3 2,273 vs the filed 3-month
+    2,272). EPS should be read from the reported 3-month column directly, not
+    de-cumulated. (Surfaced by the spot-check; not yet fixed.)
 
 ## Gotchas / lessons
 
