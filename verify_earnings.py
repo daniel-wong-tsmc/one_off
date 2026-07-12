@@ -637,7 +637,47 @@ class EdgarSource(Source):
         # COGS comes from companyconcept, or the filing instance for filers that tag
         # it only at the business-group segment level (GM). Left unchanged where the
         # identity's inputs (Revenue, OperatingIncome, COGS) aren't all available.
-        if metric == "OPERATING_EXPENSE" and series:
+        #
+        # EXCEPTION — captive-finance filers (GM, Ford, Dell, Cisco, HPE; the same
+        # set as US_FINANCE_RECEIVABLE, captive-finance for the same reason). A large
+        # financing subsidiary's revenue is consolidated into total Revenue while its
+        # cost of financing is NOT in COGS, so the identity residual wrongly absorbs
+        # the finance arm's interest/operating/other expenses (Ford 2021Q4 identity =
+        # 4,546 = SG&A 3,248 + Ford Credit 1,298; correct opex = SG&A 3,248). For
+        # these filers the identity is invalid — use the SG&A(+R&D) opex-ex-COGS line
+        # instead: keep a genuine reported OperatingExpenses tag where the filer has
+        # one (Cisco, Dell) but never a TOTAL-costs tag (GM tags total costs there,
+        # detected as OperatingExpenses ≈ Revenue − OperatingIncome) and never the
+        # identity. GM reports SG&A only at the business-group segment level in recent
+        # years, so it's read from the filing instance (summed across dims), like its
+        # segment COGS; older GM quarters and Ford/Dell/Cisco/HPE resolve SG&A(+R&D)
+        # straight from companyconcept.
+        if metric == "OPERATING_EXPENSE" and series and cik in US_FINANCE_RECEIVABLE:
+            prefer = self._resolve(cik, spec["prefer"], "flow", "USD")
+            sga_rd = self._resolve(cik, spec["else"], "flow", "USD")
+            rev = self.quarterly(api_id, "REVENUE", fye_month, years)
+            oi = self.quarterly(api_id, "OPERATING_INCOME", fye_month, years)
+            sga_dim = None
+            out = {}
+            for k in series:
+                # a genuine opex-ex-COGS OperatingExpenses tag (Cisco/Dell) is far
+                # from Revenue − OperatingIncome; keep it. A total-costs tag (GM ≈
+                # Revenue − OperatingIncome) is not opex-ex-COGS -> use SG&A(+R&D).
+                if (prefer and k in prefer and k in rev and k in oi and
+                        abs(prefer[k] - (rev[k] - oi[k])) > 0.02 * abs(rev[k] or 1)):
+                    out[k] = prefer[k]
+                    continue
+                v = sga_rd.get(k)
+                if v is None:                      # GM: SG&A only at segment level
+                    if sga_dim is None:
+                        sga_dim = self._dimensional().duration_series(
+                            cik, ["SellingGeneralAndAdministrativeExpense"],
+                            years, sum_dims=True)
+                    v = sga_dim.get(k)
+                if v is not None:
+                    out[k] = v
+            series = out or series
+        elif metric == "OPERATING_EXPENSE" and series:
             from_prefer = bool(self._resolve(cik, spec["prefer"], "flow", "USD"))
             rev = self.quarterly(api_id, "REVENUE", fye_month, years)
             oi = self.quarterly(api_id, "OPERATING_INCOME", fye_month, years)
