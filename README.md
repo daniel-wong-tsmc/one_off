@@ -68,11 +68,15 @@ python verify_earnings.py --self-test
 ### Find missing values in your own data (completeness check)
 
 Reconciliation only compares rows you *have* — a value that's simply absent never
-surfaces, because there's nothing to compare. `--check-completeness` finds those
-holes. It's offline (no API) and analyses your FA file only:
+surfaces, because there's nothing to compare. The completeness check finds those holes.
+**It runs automatically on every verification** (both the live run and the offline
+`--reference` run), writing `out/missing_values.csv` alongside the usual outputs — so
+your normal command already produces it:
 
 ```bash
-python verify_earnings.py --data-dir ./data --out-dir ./out --check-completeness
+python verify_earnings.py --data-dir ./data --out-dir ./out          # includes it
+python verify_earnings.py --data-dir ./data --out-dir ./out --check-completeness  # only this, offline
+python verify_earnings.py --data-dir ./data --out-dir ./out --no-completeness     # skip it
 ```
 
 It takes the **universe of every distinct `financial_code` in your data**, drops the
@@ -133,6 +137,9 @@ as-originally-filed figure.
 Outputs:
 - `out/verification_results.csv` — every row with a status.
 - `out/mismatches.csv` — only the rows that disagree.
+- `out/missing_values.csv` — rows ABSENT from your data (the completeness check;
+  see [Find missing values](#find-missing-values-in-your-own-data-completeness-check)).
+  Written on every run unless `--no-completeness`.
 - console — a status summary and the list of mismatches.
 - `out/export/` (with `--export`) — the **API-fetched values in your own CSV schema**
   (one file per input file). `financial_report_value` is filled from the filings

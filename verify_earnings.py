@@ -3687,7 +3687,9 @@ def print_mismatch_code_summary(code_rows):
 
 def run(data_dir: Path, out_dir: Path, compare_col: str,
         registry: dict, metric_map: dict, files_map: dict, seg_members: dict = None,
-        mapping: dict = None, export: bool = False):
+        mapping: dict = None, export: bool = False,
+        completeness_enabled: bool = True,
+        completeness_excludes=None, completeness_fill: bool = False):
     sources = {s.market: s for s in
                (EdgarSource(), OpenDartSource(), FinMindSource(), JapanSource(),
                 AKShareSource())}
@@ -4020,6 +4022,14 @@ def run(data_dir: Path, out_dir: Path, compare_col: str,
         for cid in sorted(unconfigured):
             nm = unconfigured[cid]
             print(f"  company_id={cid}" + (f"  ->  {nm}" if nm else "  (no mapped name)"))
+
+    # always-on completeness pass: surface (company, quarter, financial_code) rows
+    # MISSING from the user's own data — a gap the reconciliation above can't catch,
+    # since an absent value has no row to compare. Writes out/missing_values.csv.
+    if completeness_enabled:
+        check_completeness(data_dir, out_dir, registry, metric_map, mapping,
+                           extra_excludes=completeness_excludes,
+                           fill_gaps=completeness_fill)
     return results
 
 
@@ -4067,7 +4077,9 @@ def _strip_seg_prefix(code):
 
 def compare_against_reference(data_dir: Path, ref_dir: Path, out_dir: Path,
                               registry: dict, metric_map: dict, files_map: dict,
-                              mapping: dict = None):
+                              mapping: dict = None, completeness_enabled: bool = True,
+                              completeness_excludes=None,
+                              completeness_fill: bool = False):
     """Reconcile the user's files against a previously pulled reference/ dump —
     offline, no API calls — with fuzzy matching: financial_code via metric_map,
     segment/geo labels via fuzzy_match(), values within the usual tolerances
@@ -4249,6 +4261,12 @@ def compare_against_reference(data_dir: Path, ref_dir: Path, out_dir: Path,
         print(f"  [{r['company_id']} {r['company_name']}] {r['financial_code']} "
               f"{r['segment_code'] or ''} {r['calendar_year']}Q{r['calendar_quarter']}: "
               f"file={r['file_value']} vs ref={r['api_value_millions']}  ({r['note']})")
+
+    # always-on completeness pass on the user's own data (see run())
+    if completeness_enabled:
+        check_completeness(data_dir, out_dir, registry, metric_map, mapping,
+                           extra_excludes=completeness_excludes,
+                           fill_gaps=completeness_fill)
     return results
 
 
@@ -4472,9 +4490,12 @@ def main():
                          "excluded automatically; add more in "
                          "config/completeness_exclude.csv")
     ap.add_argument("--fill-quarter-gaps", action="store_true",
-                    help="with --check-completeness, also flag entire quarters that "
+                    help="in the completeness pass, also flag entire quarters that "
                          "are absent inside a company's first->last span (not just "
                          "missing codes within quarters that exist)")
+    ap.add_argument("--no-completeness", action="store_true",
+                    help="skip the automatic missing-values (completeness) pass that "
+                         "otherwise runs on every verification")
     args = ap.parse_args()
 
     cfg = Path(args.config_dir)
@@ -4487,6 +4508,9 @@ def main():
     if args.self_test:
         seg_members = load_segment_members(cfg / "segment_members.csv") or seg_members
     mapping = load_company_mapping(find_mapping_file(Path(args.data_dir), args.mapping_file))
+    # completeness excludes are loaded once and shared by the standalone check and
+    # the automatic pass folded into run()/compare_against_reference.
+    excludes = load_completeness_excludes(cfg / "completeness_exclude.csv")
     if not registry:
         print("WARNING: empty company_registry.csv — every row will be COMPANY_NOT_CONFIGURED")
     if args.dump:
@@ -4495,18 +4519,25 @@ def main():
                        include_seg=args.dump_seg, seg_members=seg_members)
         return
     if args.check_completeness:
-        excludes = load_completeness_excludes(cfg / "completeness_exclude.csv")
         check_completeness(Path(args.data_dir), Path(args.out_dir), registry,
                            metric_map, mapping, extra_excludes=excludes,
                            fill_gaps=args.fill_quarter_gaps)
         return
+    # the automatic completeness pass runs on every verification unless disabled.
+    do_completeness = not args.no_completeness
     if args.reference:
         compare_against_reference(Path(args.data_dir), Path(args.reference),
                                   Path(args.out_dir), registry, metric_map,
-                                  DEFAULT_FILES, mapping)
+                                  DEFAULT_FILES, mapping,
+                                  completeness_enabled=do_completeness,
+                                  completeness_excludes=excludes,
+                                  completeness_fill=args.fill_quarter_gaps)
         return
     run(Path(args.data_dir), Path(args.out_dir), args.compare_column,
-        registry, metric_map, DEFAULT_FILES, seg_members, mapping, args.export)
+        registry, metric_map, DEFAULT_FILES, seg_members, mapping, args.export,
+        completeness_enabled=do_completeness,
+        completeness_excludes=excludes,
+        completeness_fill=args.fill_quarter_gaps)
 
 
 if __name__ == "__main__":
