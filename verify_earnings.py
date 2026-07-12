@@ -1494,22 +1494,45 @@ class OpenDartSource(Source):
             if not rows:
                 continue
             t = rows[0]
-            # SG&A functional breakdown: carries the 판매비와관리비 total row and a
-            # 급여 (salaries) component row — distinguishes it from the income
-            # statement (판관비 as one P&L line, no components) and the R&D-activity
-            # note (no 판매비와관리비 total).
-            if not any(_seg_norm(c) == _seg_norm("판매비와관리비") for r in t for c in r):
-                continue
-            if not any("급여" in c for r in t for c in r):
-                continue
-            rd_row = None
-            for r in t:
+
+            def _row_label(r):
                 labels = []
                 for c in r:
                     if _kr_num(c) is not None:
                         break
                     labels.append(c)
-                lab = " ".join(labels)
+                return " ".join(labels)
+
+            # SG&A functional breakdown: a 급여 (salaries) component row plus a grand-
+            # total row, telling it apart from the income statement (판관비 as one P&L
+            # line, no 급여 component) and the standalone R&D-activity / deferred-tax
+            # notes. Recognise it by STRUCTURE + caption rather than a literal
+            # 판매비와관리비 body cell: some filers label the grand-total row 판매비와관리비
+            # (caught below), others 계, and put 판매비와관리비 only in the note caption
+            # (e.g. Hyundai's "28. 판매비와관리비" with a 계 total row and 판매비와관리비
+            # absent from the table body). So accept either a 판매비와관리비 body cell
+            # (the original path) OR a table sitting under a 판매비와관리비 caption whose
+            # grand-total row is labelled 계 (or 판매비와관리비). The caption anchor keeps
+            # out the R&D-activity note (연구개발비용 caption) and the deferred-tax
+            # reconciliation (no 판매비와관리비 caption). The grand-total label is
+            # restricted to 계 / 판매비와관리비 on purpose: notes that instead total to
+            # 합계 (annual-only or per-quarter-inconsistent functional breakdowns) don't
+            # share the interim reports' de-cumulation basis, so recognising them would
+            # corrupt the R&D series rather than complete it.
+            _totals = {_seg_norm("계"), _seg_norm("판매비와관리비")}
+            has_sga_cell = any(_seg_norm(c) == _seg_norm("판매비와관리비")
+                               for r in t for c in r)
+            if not has_sga_cell:
+                cap = text[max(0, ts - 800):ts]
+                if "판매비와관리비" not in cap:
+                    continue
+                if not any(_seg_norm(_row_label(r)) in _totals for r in t):
+                    continue
+            if not any("급여" in c for r in t for c in r):
+                continue
+            rd_row = None
+            for r in t:
+                lab = _row_label(r)
                 if ("연구" in lab or "개발" in lab) and "무형자산" not in lab \
                         and "개척" not in lab:
                     rd_row = r
