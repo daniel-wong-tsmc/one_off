@@ -175,6 +175,8 @@ def print_table(rows: list[dict]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Pull IR calendar events via yfinance.")
     parser.add_argument("--json", action="store_true", help="emit JSON")
+    parser.add_argument("--csv", action="store_true",
+                        help="emit a minimal CSV of company,next_earnings_date")
     parser.add_argument("--watchlist", default=DEFAULT_WATCHLIST,
                         help="CSV of company,ticker,note (default: watchlist.csv)")
     args = parser.parse_args(argv)
@@ -182,7 +184,12 @@ def main(argv: list[str] | None = None) -> int:
     companies = load_companies(args.watchlist)
     rows, errors = build_rows(companies)
 
-    if args.json:
+    if args.csv:
+        w = csv.writer(sys.stdout)
+        w.writerow(["company", "next_earnings_date"])
+        for r in rows:
+            w.writerow([r["company"], r.get("nextEarningsDate") or ""])
+    elif args.json:
         print(json.dumps(rows, indent=2))
     else:
         print(f"Investor-Relations calendar events "
