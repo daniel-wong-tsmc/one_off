@@ -23,6 +23,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -34,20 +35,19 @@ warnings.filterwarnings("ignore")
 from curl_cffi import requests as cffi_requests  # noqa: E402
 import yfinance as yf  # noqa: E402
 
-# name -> (yahoo ticker, note).  ticker=None means no listed security.
-COMPANIES: list[tuple[str, str | None, str]] = [
-    ("3M Company",                       "MMM",       ""),
-    ("ABB Taiwan",                       "ABBN.SW",   "subsidiary of ABB Ltd; parent's calendar (SIX Swiss)"),
-    ("Accretech",                        "7729.T",    "= Tokyo Seimitsu Co., Ltd."),
-    ("Accton",                           "2345.TW",   ""),
-    ("Acer",                             "2353.TW",   "Acer Incorporated"),
-    ("ADTechnology",                     "200710.KQ", "ADTechnology Co., Ltd. (KOSDAQ)"),
-    ("Advanced Echem Materials Co Ltd",  "4749.TWO",  "TPEx"),
-    ("Advanced Energy Industries Inc",   "AEIS",      ""),
-    ("Advanced Micro Devices Inc",       "AMD",       ""),
-    ("Advantest Corp",                   "6857.T",    ""),
-    ("AGC",                              "5201.T",    "AGC Inc. (Asahi Glass)"),
-]
+DEFAULT_WATCHLIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.csv")
+
+
+def load_companies(path: str) -> list[tuple[str, str | None, str]]:
+    """Load (company, ticker, note) rows from a CSV with those headers.
+    An empty ticker cell means the company has no listed security."""
+    out = []
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            ticker = (row.get("ticker") or "").strip() or None
+            out.append(((row.get("company") or "").strip(), ticker,
+                        (row.get("note") or "").strip()))
+    return out
 
 
 def make_session() -> cffi_requests.Session:
@@ -132,10 +132,10 @@ def get_ir_events(ticker: str, session) -> dict:
     }
 
 
-def build_rows() -> tuple[list[dict], list[tuple[str, str]]]:
+def build_rows(companies: list[tuple[str, str | None, str]]) -> tuple[list[dict], list[tuple[str, str]]]:
     session = make_session()
     rows, errors = [], []
-    for name, ticker, note in COMPANIES:
+    for name, ticker, note in companies:
         row = {"company": name, "ticker": ticker, "note": note}
         if ticker is None:
             row.update(nextEarningsDate=None, status="not listed")
@@ -175,9 +175,12 @@ def print_table(rows: list[dict]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Pull IR calendar events via yfinance.")
     parser.add_argument("--json", action="store_true", help="emit JSON")
+    parser.add_argument("--watchlist", default=DEFAULT_WATCHLIST,
+                        help="CSV of company,ticker,note (default: watchlist.csv)")
     args = parser.parse_args(argv)
 
-    rows, errors = build_rows()
+    companies = load_companies(args.watchlist)
+    rows, errors = build_rows(companies)
 
     if args.json:
         print(json.dumps(rows, indent=2))
