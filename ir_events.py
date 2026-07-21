@@ -91,7 +91,7 @@ def get_ir_events(ticker: str, session) -> dict:
     t = yf.Ticker(ticker, session=session)
     today = datetime.now(timezone.utc).date()
 
-    next_date = next_time = None
+    next_date = next_time = next_taipei = None
     next_eps = last_reported = None
     try:
         df = t.get_earnings_dates(limit=24)
@@ -105,8 +105,13 @@ def get_ir_events(ticker: str, session) -> dict:
         if upcoming:
             nxt = min(upcoming)
             next_date = nxt.date().isoformat()
-            # tz-aware timestamp carries the announcement time (BMO/AMC).
+            # yfinance returns a real instant but normalises the wall-clock to
+            # US/Eastern for every exchange (not the exchange-local time).  Keep
+            # that as-is, and convert the same instant to Taipei time (UTC+8,
+            # no DST) -- which frequently rolls to the next calendar day.
             next_time = nxt.strftime("%H:%M %Z").strip() or None
+            taipei = nxt.tz_convert("Asia/Taipei")
+            next_taipei = taipei.strftime("%Y-%m-%d %H:%M")
             eps = df.loc[nxt, "EPS Estimate"]
             next_eps = float(eps) if eps == eps else None  # NaN check
         if reported:
@@ -124,7 +129,8 @@ def get_ir_events(ticker: str, session) -> dict:
     return {
         "ticker": ticker,
         "nextEarningsDate": next_date,
-        "nextEarningsTime": next_time,
+        "nextEarningsTimeET": next_time,
+        "nextEarningsTaipei": next_taipei,
         "nextEpsEstimate": next_eps,
         "lastReported": last_reported,
         "exDividendDate": ex_div,
@@ -186,9 +192,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.csv:
         w = csv.writer(sys.stdout)
-        w.writerow(["company", "next_earnings_date"])
+        w.writerow(["company", "next_earnings_date",
+                    "next_earnings_time_ET", "next_earnings_taipei"])
         for r in rows:
-            w.writerow([r["company"], r.get("nextEarningsDate") or ""])
+            w.writerow([r["company"], r.get("nextEarningsDate") or "",
+                        r.get("nextEarningsTimeET") or "",
+                        r.get("nextEarningsTaipei") or ""])
     elif args.json:
         print(json.dumps(rows, indent=2))
     else:
